@@ -1,7 +1,8 @@
 # Build windowed exe without removing previous builds or stopping running apps.
 param(
   [string]$Destination,
-  [switch]$SkipDependencyInstall
+  [switch]$SkipDependencyInstall,
+  [switch]$ReuseNativeHost
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -25,8 +26,15 @@ if (-not $SkipDependencyInstall) {
 }
 
 Write-Host "==> native web host"
-dotnet publish .\native_host\JiXingModHelperHost.csproj -c Release -r win-x64 --self-contained true --output .\native_host\publish
-if ($LASTEXITCODE -ne 0) { throw "Native web host build failed" }
+if ($ReuseNativeHost) {
+  if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'native_host\publish\JiXingModHelperHost.exe'))) {
+    throw 'No existing native host is available. Build it before using -ReuseNativeHost.'
+  }
+  Write-Host 'Using existing native host. Verify its source and contents before local packaging.'
+} else {
+  dotnet publish .\native_host\JiXingModHelperHost.csproj -c Release -r win-x64 --self-contained true --output .\native_host\publish
+  if ($LASTEXITCODE -ne 0) { throw "Native web host build failed" }
+}
 
 Write-Host "==> pyinstaller"
 python -m PyInstaller --distpath $outputRoot --workpath $buildPath build_exe.spec
@@ -61,6 +69,20 @@ $unexpectedAudioFiles = Get-ChildItem -LiteralPath $audioDestination -File -Recu
   Where-Object { $_.Extension -in '.exe', '.dll', '.zip' }
 if ($unexpectedAudioFiles -or (Test-Path -LiteralPath (Join-Path $out '_internal\tools\audio\vgmstream'))) {
   throw 'Audio runtime binaries must not be included in the release package.'
+}
+
+# Keep optional FFmpeg setup materials separate from downloaded runtime files.
+$emoteSource = Join-Path $PSScriptRoot 'tools\emote'
+$emoteDestination = Join-Path $out 'tools\emote'
+New-Item -ItemType Directory -Path $emoteDestination -Force | Out-Null
+foreach ($name in @('fetch_ffmpeg.ps1', 'source.json', 'README.md', 'licenses')) {
+  Copy-Item -LiteralPath (Join-Path $emoteSource $name) -Destination $emoteDestination -Recurse
+}
+Copy-Item -LiteralPath (Join-Path $emoteSource '获取表情转换组件.cmd') -Destination $out
+$unexpectedEmoteFiles = Get-ChildItem -LiteralPath $emoteDestination -File -Recurse |
+  Where-Object { $_.Extension -in '.exe', '.dll', '.zip' }
+if ($unexpectedEmoteFiles -or (Test-Path -LiteralPath (Join-Path $out '_internal\tools\emote\ffmpeg'))) {
+  throw 'FFmpeg runtime binaries must not be included in the release package.'
 }
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'PREVIEW_GUIDE.md') -Destination (Join-Path $out '使用说明.md')
