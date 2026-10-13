@@ -95,6 +95,8 @@ class DesktopApi:
         self._emote_replacement: dict | None = None
         self._emote_candidate_dir = None
         self._emote_preview_cache: dict[tuple, dict] = {}
+        self._visual_candidate = None
+        self._visual_candidate_dir = None
         self._draft_crop_path: Path | None = None
         self._draft_crop_index: int | None = None
         self._draft_crop_item: dict | None = None
@@ -107,6 +109,222 @@ class DesktopApi:
         self.controller = ModController(self._append_log)
         self._audio_workspace = None
         self._update_checker = UpdateChecker(__version__)
+        self._workshop_client = None
+        self._workshop_pending = None
+        self._workshop_submission = None
+        self._workshop_issue_url = None
+        self._workshop_upload_client = None
+
+    def _workshop(self):
+        if self._workshop_client is None:
+            from .modkit.workshop import WorkshopClient
+            self._workshop_client = WorkshopClient(DATA_DIR)
+        return self._workshop_client
+
+    def _workshop_upload(self):
+        if getattr(self, "_workshop_upload_client", None) is None:
+            from .modkit.workshop_upload import WorkshopUploadClient
+            self._workshop_upload_client = WorkshopUploadClient(DATA_DIR)
+        return self._workshop_upload_client
+
+    def _clear_workshop_pending(self) -> None:
+        pending = getattr(self, "_workshop_pending", None)
+        self._workshop_pending = None
+        if pending is not None:
+            cleanup = self._workshop().discard(pending)
+            if isinstance(cleanup, dict) and not cleanup.get("removed"):
+                self._append_log("工坊暂存保留：" + cleanup.get("message", "暂存无法安全清理。"))
+
+    def _workshop_analysis(self, directory: Path, entry: dict) -> dict:
+        manager = self.controller.manager
+        if manager is None:
+            return {"matched": 0, "unmatched": 0, "conflicts": 0, "conflict_names": [],
+                    "can_install": False, "message": "未检测到游戏；可以浏览和投稿，安装需要先连接游戏。"}
+        analysis = manager.analyze_mod(directory)
+        name = "工坊 " + entry["id"]
+        conflict_files = set()
+        conflicts = []
+        for mod_name, mod in manager._load_state().get("mods", {}).items():
+            overlap = set(analysis.matched).intersection(mod.get("files", []))
+            if mod_name != name and not mod.get("disabled", False) and overlap:
+                conflicts.append(mod_name)
+                conflict_files.update(overlap)
+        compatible = bool(analysis.matched) and not analysis.unmatched
+        return {"matched": len(analysis.matched), "unmatched": len(analysis.unmatched),
+                "conflicts": len(conflict_files), "conflict_names": conflicts, "can_install": compatible,
+                "matched_names": sorted(analysis.matched), "unmatched_names": sorted(analysis.unmatched),
+                "message": "资源名称匹配，仍请核对作者标注的游戏版本。" if compatible else "资源与当前游戏不完全匹配，工坊停止安装。"}
+
+    def _workshop_forbidden_bundles(self) -> set[str]:
+        if not getattr(self.controller, "aa_dirs", ()):
+            return set()
+        from .modkit.workshop_security import forbidden_workshop_bundle_names
+        return forbidden_workshop_bundle_names(self.controller.aa_dirs)
+
+    @exposed
+    def workshop_catalog(self, force: bool = False) -> dict:
+        return self._workshop().catalog(force=bool(force))
+
+    @exposed
+    def workshop_prepare(self, mod_id: str, sha256: str) -> dict:
+        self._clear_workshop_pending()
+        prepared = self._workshop().prepare(mod_id, expected_sha256=sha256, forbidden_bundle_names=self._workshop_forbidden_bundles())
+        try:
+            analysis = self._workshop_analysis(Path(prepared["mod_dir"]), prepared["entry"])
+            prepared["game_key"] = self.controller._index_source_key
+            prepared["analysis"] = analysis
+            self._workshop_pending = prepared
+            return {"entry": prepared["entry"], "inspection": prepared["inspection"], "analysis": analysis}
+        except Exception:
+            self._workshop().discard(prepared)
+            raise
+
+    @exposed
+    def workshop_install(self) -> dict:
+        from .modkit.workshop_security import scan_workshop_package
+        previous = self._workshop_pending
+        if previous is None:
+            raise ValueError("请先下载并检查一个工坊作品。")
+        entry = previous["entry"]
+        game_key = previous["game_key"]
+        previous_analysis = previous.get("analysis")
+        self._clear_workshop_pending()
+        if game_key != self.controller._index_source_key or self.controller.manager is None:
+            raise ValueError("游戏目录已改变，请重新下载并检查作品。")
+        # 即使刚才下载通过，也要重新检查撤回状态和目录摘要。
+        prepared = self._workshop().prepare(entry["id"], expected_sha256=entry["asset"]["sha256"], forbidden_bundle_names=self._workshop_forbidden_bundles())
+        try:
+            analysis = self._workshop_analysis(Path(prepared["mod_dir"]), prepared["entry"])
+            if not analysis["can_install"]:
+                raise ValueError(analysis["message"])
+            keys = ("matched", "unmatched", "conflicts", "matched_names", "unmatched_names", "conflict_names")
+            if previous_analysis is None or any(analysis.get(key) != previous_analysis.get(key) for key in keys):
+                raise ValueError("资源匹配或 Mod 冲突已改变，请重新下载并检查后确认安装。")
+            self.controller._require_catalog_game_stopped()
+            scan = scan_workshop_package(Path(prepared["mod_dir"]))
+            self._workshop().verify_prepared(prepared, forbidden_bundle_names=self._workshop_forbidden_bundles())
+            name = "工坊 " + entry["id"]
+            result = self.controller.install(Path(prepared["mod_dir"]), name=name)
+            self._append_log(f"工坊安装完成：{entry['name']} {entry['version']}；已通过格式、摘要和本机扫描。")
+            return {"name": name, "matched": len(result.matched), "entry": prepared["entry"], "scan": scan,
+                    "installed": self.controller.installed_mods(), "dashboard": self._dashboard_state()}
+        finally:
+            self._workshop().discard(prepared)
+
+    @exposed
+    def workshop_choose_submission(self) -> dict:
+        from .modkit.workshop import inspect_package
+        self._workshop_submission = None
+        self._workshop_issue_url = None
+        path = self._pick_path("open", file_types=("资源替换 Mod ZIP (*.zip)",))
+        if path is None:
+            return {"cancelled": True}
+        inspection = inspect_package(path, forbidden_bundle_names=self._workshop_forbidden_bundles())
+        self._workshop_submission = {"path": path, "sha256": inspection["sha256"]}
+        return {"cancelled": False, "path_label": path.name, "inspection": inspection}
+
+    @exposed
+    def get_workshop_upload_status(self, refresh: bool = False) -> dict:
+        return {**self._workshop_upload().snapshot(refresh=bool(refresh)), "game_version": ""}
+
+    @exposed
+    def submit_workshop_upload(self, metadata: dict) -> dict:
+        """复制已检查作品再上传；不发送源路径、编辑记录或审核日志。"""
+        from .modkit.workshop import inspect_package, prepare_submission, validate_metadata
+        candidate = self._workshop_submission
+        if candidate is None:
+            raise ValueError("请先选择投稿 ZIP。")
+        if not isinstance(metadata, dict):
+            raise ValueError("投稿信息无效。")
+        client = self._workshop_upload()
+        state = client.snapshot()
+        if not state["configured"]:
+            raise RuntimeError(state["message"])
+        forbidden = self._workshop_forbidden_bundles()
+        if inspect_package(candidate["path"], forbidden_bundle_names=forbidden)["sha256"] != candidate["sha256"]:
+            self._workshop_submission = None
+            raise ValueError("投稿 ZIP 已改变，请重新选择。")
+        details = dict(metadata)
+        if not details.get("version"):
+            details["version"] = "1.0.0"
+        if not details.get("game_version"):
+            details["game_version"] = "未标注"
+        details["id"] = "pending"
+        details = validate_metadata(details)
+        # 同原件和资料在重选、重启后仍得到同一编号，丢失回执不会重复投稿。
+        identity = json.dumps({key: value for key, value in details.items() if key != "id"},
+                              ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        details["id"] = "mod-" + hashlib.sha256(candidate["sha256"].encode("ascii") + b"\0" + identity).hexdigest()[:32]
+        stage_root = DATA_DIR / "workshop-upload-staging"
+        stage_root.mkdir(parents=True, exist_ok=True)
+        if stage_root.is_symlink() or getattr(stage_root.lstat(), "st_file_attributes", 0) & 0x400:
+            raise ValueError("投稿暂存目录不安全，已停止上传。")
+        with tempfile.TemporaryDirectory(prefix="submission-", dir=stage_root) as temporary:
+            prepared = prepare_submission(candidate["path"], details, Path(temporary) / "submission.zip",
+                                          forbidden_bundle_names=forbidden)
+            if (self._workshop_submission is not candidate
+                    or inspect_package(candidate["path"], forbidden_bundle_names=forbidden)["sha256"] != candidate["sha256"]):
+                self._workshop_submission = None
+                raise ValueError("投稿作品在准备期间发生改变，请重新选择。")
+            inspection = inspect_package(prepared["path"], forbidden_bundle_names=forbidden)
+            if (inspection["sha256"] != prepared["inspection"]["sha256"]
+                    or inspection["size"] != prepared["inspection"]["size"]):
+                raise ValueError("投稿暂存发生改变，请重新选择。")
+            result = client.upload(prepared["path"], details, expected_sha256=inspection["sha256"],
+                                   expected_size=inspection["size"])
+        self._append_log("工坊投稿已确认：" + details["name"] + "；" + result["message"])
+        return result
+
+    @exposed
+    def workshop_export_submission(self, metadata: dict) -> dict:
+        from uuid import uuid4
+        from .modkit.workshop import inspect_package, prepare_submission, validate_metadata
+        candidate = self._workshop_submission
+        self._workshop_issue_url = None
+        if candidate is None:
+            raise ValueError("请先选择投稿 ZIP。")
+        if not isinstance(metadata, dict):
+            raise ValueError("投稿信息无效。")
+        if inspect_package(candidate["path"], forbidden_bundle_names=self._workshop_forbidden_bundles())["sha256"] != candidate["sha256"]:
+            self._workshop_submission = None
+            raise ValueError("投稿 ZIP 已改变，请重新选择。")
+        details = dict(metadata)
+        if not details.get("version"):
+            details["version"] = "1.0.0"
+        if not details.get("game_version"):
+            details["game_version"] = "未标注"
+        details["id"] = "mod-" + uuid4().hex[:20]
+        details = validate_metadata(details)
+        destination = self._pick_path("save", file_types=("投稿 ZIP (*.zip)",), save_filename="workshop-submission.zip")
+        if destination is None:
+            return {"cancelled": True}
+        if destination.suffix.lower() != ".zip":
+            destination = destination.with_suffix(".zip")
+        if destination.resolve() == candidate["path"].resolve():
+            raise ValueError("请另存投稿包，不能覆盖原始作品。")
+        if inspect_package(candidate["path"], forbidden_bundle_names=self._workshop_forbidden_bundles())["sha256"] != candidate["sha256"]:
+            self._workshop_submission = None
+            raise ValueError("投稿 ZIP 在选择保存位置时发生改变，请重新选择。")
+        result = prepare_submission(candidate["path"], details, destination, forbidden_bundle_names=self._workshop_forbidden_bundles())
+        return {"cancelled": False, **result}
+
+    @exposed
+    def workshop_open_link(self, kind: str, mod_id: str = "") -> bool:
+        from urllib.parse import urlencode
+        if kind == "submission":
+            raise ValueError("请在工坊内填写资料并点击上传，无需打开 GitHub。")
+        elif kind == "report":
+            # 固定仓库入口，远端条目不能指定任意导航地址。
+            entry = next((item for item in self._workshop().catalog()["mods"] if item["id"] == mod_id), None)
+            if entry is None:
+                raise ValueError("作品已不在当前目录，请刷新工坊。")
+            url = REPOSITORY_URL + "/issues/new?" + urlencode({"title": "[工坊举报] " + entry["id"], "body": "作品：" + entry["id"] + "\n请描述问题及复现情况，不要公开个人信息。"})
+        elif kind == "repository":
+            url = REPOSITORY_URL + "/tree/workshop"
+        else:
+            raise ValueError("未知的工坊链接。")
+        os.startfile(url)
+        return True
 
     @exposed
     def check_for_updates(self, force: bool = False) -> dict:
@@ -374,7 +592,9 @@ class DesktopApi:
 
     @exposed
     def refresh_detection(self) -> dict:
+        self._clear_workshop_pending()
         self._clear_emote_candidate()
+        self._clear_visual_candidate()
         self._replacement_path = None
         self.controller.refresh_detection()
         if self.controller.has_game:
@@ -723,6 +943,7 @@ class DesktopApi:
     def select_asset(self, asset_type: str, bundle: str, name: str, force: bool = False) -> dict:
         self._replacement_path = None
         self._clear_emote_candidate()
+        self._clear_visual_candidate()
         selection = self.controller.set_selection(
             bundle,
             name,
@@ -734,6 +955,7 @@ class DesktopApi:
     @exposed
     def refresh_selection(self) -> dict | None:
         self._clear_emote_candidate()
+        self._clear_visual_candidate()
         if not self.controller.selection:
             return None
         sel = self.controller.selection
@@ -747,7 +969,66 @@ class DesktopApi:
 
     @exposed
     def get_studio_state(self) -> dict | None:
+        selection = self.controller.selection
+        if selection and selection.get("visual_animation"):
+            selection["visual_animation"] = self.controller.visual_animation_workspace.selection(selection["name"])
         return self._selection_payload(full_text=True)
+
+    def _clear_visual_candidate(self) -> None:
+        self._visual_candidate = None
+        folder = getattr(self, "_visual_candidate_dir", None)
+        self._visual_candidate_dir = None
+        if folder is not None:
+            try:
+                folder.cleanup()
+            except OSError as exc:
+                self._append_log(f"动态资源制作缓存暂未清理：{folder.name}（{exc}）")
+
+    @exposed
+    def choose_visual_animation(self) -> dict | None:
+        self._clear_visual_candidate()
+        workspace = self.controller.visual_animation_workspace
+        workspace._selection()
+        key = self._emote_selection_key()
+        path = self._pick_path("open", file_types=("动图或视频 (*.gif;*.apng;*.webp;*.png;*.mp4;*.webm;*.mov;*.mkv;*.avi)", "所有文件 (*.*)"))
+        if path is None:
+            return None
+        if key != self._emote_selection_key():
+            raise ValueError("当前选择已改变，请重新导入。")
+        parent = DATA_DIR / "visual-animation-candidates"
+        parent.mkdir(parents=True, exist_ok=True)
+        self._visual_candidate_dir = tempfile.TemporaryDirectory(prefix="import-", dir=parent)
+        try:
+            prepared = workspace.prepare(path, Path(self._visual_candidate_dir.name))
+            if key != self._emote_selection_key():
+                raise ValueError("当前选择已改变，请重新导入。")
+            prepared["selection"] = key
+            self._visual_candidate = prepared
+            return {"name": path.name, "animation": prepared["animation"], "notice": prepared["notice"]}
+        except Exception:
+            self._clear_visual_candidate()
+            raise
+
+    @exposed
+    def get_visual_animation_preview(self) -> dict:
+        return self.controller.visual_animation_workspace.draft_preview()
+
+    @exposed
+    def save_visual_animation(self) -> dict:
+        candidate = self._visual_candidate
+        self._visual_candidate = None
+        try:
+            if candidate is None or candidate.get("selection") != self._emote_selection_key():
+                raise ValueError("没有当前资源的动态候选，请重新导入。")
+            item = self.controller.visual_animation_workspace.save(candidate)
+            self.controller.selection["visual_animation"] = self.controller.visual_animation_workspace.selection(item["name"])
+            try:
+                animation = self.controller.visual_animation_workspace.draft_preview()
+            except (OSError, ValueError, KeyError) as exc:
+                animation = {"frames": [], "notice": f"动态作品已经保存，重新加载预览失败：{exc}"}
+            return {"item": item, "animation": animation, "draft": self._draft_state()}
+        finally:
+            self._clear_visual_candidate()
 
     def _emote_selection_key(self) -> tuple:
         selection = self.controller.selection or {}
@@ -1105,6 +1386,20 @@ class DesktopApi:
                                     "independent_video": item.get("independent_video", False),
                                     "custom_video": item.get("custom_video", False),
                                     "preview_notice": result["emote_animation"].get("notice", "")}
+        elif item.get("kind") == "visual_animation":
+            source = self.controller.original_bundle_path(item["source_bundle"])
+            if source is None:
+                raise ValueError("动态资源的原图片缺失。")
+            image, _ = self.controller.preview_bundle(source, item["name"], tag="visual-original")
+            result["original_data"] = self._image_data(image)
+            workspace = self.controller.visual_animation_workspace
+            try:
+                context = workspace.context()
+                result["modified_animation"] = workspace.preview(item["name"], self.controller._draft_dir() / context["ui_bundle"], self.controller._draft_dir() / context["atlas_bundle"])
+            except (OSError, ValueError, KeyError) as exc:
+                result["modified_animation"] = {"frames": [], "notice": f"作品已保存，但动态预览未加载：{exc}。可以重新打开检查或移除这一项。"}
+            result["visual_info"] = {"label": "动态卡面 / 立绘（试用）", "frame_count": item["frame_count"],
+                                     "duration_ms": item["duration_ms"], "notice": result["modified_animation"]["notice"]}
         elif item.get("kind") == "text":
             result["original_text"] = self.controller.read_text(original, item["name"])
             result["modified_text"] = self.controller.read_text(modified, item["name"])
@@ -1136,8 +1431,8 @@ class DesktopApi:
         index = int(index)
         if not (0 <= index < len(self.controller.draft_items)):
             raise RuntimeError("作品集项不存在。")
-        if self.controller.draft_items[index].get("kind") == "emote":
-            raise RuntimeError("动态表情请在制作页更换视频，不能通过普通换图修改。")
+        if self.controller.draft_items[index].get("kind") in ("emote", "visual_animation"):
+            raise RuntimeError("动态资源请在制作页更换素材，不能通过普通换图修改。")
         path = self._pick_path(
             "open",
             file_types=("图片 (*.png;*.jpg;*.jpeg;*.webp;*.bmp)", "所有文件 (*.*)"),
@@ -1159,8 +1454,8 @@ class DesktopApi:
         index = int(index)
         if not (0 <= index < len(self.controller.draft_items)):
             raise RuntimeError("作品集项不存在。")
-        if self.controller.draft_items[index].get("kind") == "emote":
-            raise RuntimeError("动态表情请在制作页更换视频，不能通过普通裁剪修改。")
+        if self.controller.draft_items[index].get("kind") in ("emote", "visual_animation"):
+            raise RuntimeError("动态资源请在制作页更换素材，不能通过普通裁剪修改。")
         if self.controller.draft_items[index].get("from_anim"):
             raise RuntimeError("动画完整图集不能裁剪，请保留原图集尺寸和布局。")
         path = self._pick_path(
@@ -1212,8 +1507,8 @@ class DesktopApi:
             raise RuntimeError("作品集项不存在。")
         if self.controller.draft_items[index] != expected_item:
             raise RuntimeError("作品集已变化，请重新选择要裁剪的项目和图片。")
-        if self.controller.draft_items[index].get("kind") == "emote":
-            raise RuntimeError("动态表情请在制作页更换视频，不能通过普通裁剪修改。")
+        if self.controller.draft_items[index].get("kind") in ("emote", "visual_animation"):
+            raise RuntimeError("动态资源请在制作页更换素材，不能通过普通裁剪修改。")
         if self.controller.draft_items[index].get("from_anim"):
             raise RuntimeError("动画完整图集不能裁剪，请保留原图集尺寸和布局。")
         box = tuple(int(v) for v in crop_box) if crop_box else None
