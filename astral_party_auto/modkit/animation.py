@@ -129,11 +129,51 @@ def _sequence_info(rows) -> dict:
             "frame_names": [row[0] for row in rows], "width": width, "height": height, "total": len(rows)}
 
 
+def _frame_animation_info(env, asset_name: str, reason: Exception) -> dict | None:
+    """序列帧解析失败时，尝试按多瓦片图集识别（回退，不改变常规序列帧行为）。"""
+    from .frame_atlas import atlas_details, read_frames
+
+    try:
+        _, details = atlas_details(env, asset_name)
+        frames = read_frames(env, details["atlas_name"])
+    except Exception:
+        return None
+    return {
+        "animation_kind": "sprite_clip",
+        "editable": True,
+        "reason": "",
+        "notice": f"AnimationClip 无法按单轨解析（{reason}），已改用多瓦片图集逐帧处理。"
+                  + str(details.get("notice", "")),
+        "frame_names": [frame.name for frame in frames],
+        "width": details["first_frame_size"][0],
+        "height": details["first_frame_size"][1],
+        "total": len(frames),
+        "frame_atlas": True,
+        "texture": details["atlas_name"],
+        "atlas_name": details["atlas_name"],
+        "atlas_width": details["atlas_width"],
+        "atlas_height": details["atlas_height"],
+        "atlas_editable": True,
+    }
+
+
 @_release_readers
 def inspect_animation(bundle_path: str | Path, asset_name: str, kind: str = "sequence") -> dict:
     env = _load_bundle(bundle_path)
     if kind == "sequence":
-        return _sequence_info(_sequence(env, asset_name))
+        try:
+            rows = _sequence(env, asset_name)
+        except ValueError as exc:
+            fallback = _frame_animation_info(env, asset_name, exc)
+            if fallback is not None:
+                return fallback
+            raise
+        info = _sequence_info(rows)
+        if not info["editable"]:
+            fallback = _frame_animation_info(env, asset_name, ValueError(info["reason"]))
+            if fallback is not None:
+                return fallback
+        return info
     if kind not in IMAGE_KINDS:
         return {"animation_kind": kind, "editable": False, "reason": "此动画格式暂不支持直接替换。"}
     _, data = _text_asset(env, asset_name)
@@ -267,7 +307,9 @@ def read_animation_preview(bundle_path: str | Path, asset_name: str, kind: str =
 def _set_image(data, image: Image.Image) -> None:
     image = image.convert("RGBA")
     mipmaps = max(1, int(getattr(data, "m_MipCount", 1) or 1))
-    data.set_image(image, mipmap_count=mipmaps)
+    # 保留原贴图格式（BC7/DXT5 等）；UnityPy 会按该格式重新压缩，
+    # 否则写回会退化为未压缩 RGBA，单包体积成倍增加。
+    data.set_image(image, target_format=int(data.m_TextureFormat), mipmap_count=mipmaps)
     data.save()
 
 
@@ -283,7 +325,13 @@ def _set_text_bytes(data, raw: bytes) -> None:
 def _atomic_save(env, out_bundle: str | Path, validate) -> None:
     out = Path(out_bundle)
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload = env.file.save()
+    # 沿用原包的压缩方式（LZ4/LZMA）；默认不压缩会让 24MB 的包涨到 90MB 以上。
+    from UnityPy.files import BundleFile, SerializedFile
+
+    if isinstance(env.file, (BundleFile, SerializedFile)):
+        payload = env.file.save(packer="original")
+    else:
+        payload = env.file.save()
     # Verify the serialized bundle, not just the in-memory edited objects.
     validate(UnityPy.load(payload))
     handle, name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=out.parent)
@@ -335,8 +383,15 @@ def read_adapted_replacement(bundle_path: str | Path, asset_name: str, replaceme
     rate = _fps(fps)
     env = _load_bundle(bundle_path)
     if kind == "sequence":
-        rows = _sequence(env, asset_name)
-        sizes = _sequence_sizes(rows)
+        try:
+            rows = _sequence(env, asset_name)
+            sizes = _sequence_sizes(rows)
+        except ValueError as exc:
+            fallback = _frame_animation_info(env, asset_name, exc)
+            if fallback is None:
+                raise
+            from .frame_atlas import read_adapted_frames
+            return read_adapted_frames(bundle_path, asset_name, replacement_path, rate)
         frames, durations, _ = _read_replacement(replacement_path, rate)
         sampled = _resample_indices(durations, len(rows))
         indices, preview_durations = _preview_indices(len(rows), [1000 / rate] * len(rows))
@@ -364,9 +419,18 @@ def replace_bundle_sequence(src_bundle: str | Path, asset_name: str, replacement
                             out_bundle: str | Path, fps: float = 30) -> dict:
     rate = _fps(fps)
     env = _load_bundle(src_bundle)
-    rows = _sequence(env, asset_name)
-    info = _sequence_info(rows)
-    expected_sizes = _sequence_sizes(rows)
+    try:
+        rows = _sequence(env, asset_name)
+        info = _sequence_info(rows)
+        expected_sizes = _sequence_sizes(rows)
+    except ValueError as exc:
+        fallback = _frame_animation_info(env, asset_name, exc)
+        if fallback is None:
+            raise
+        from .frame_atlas import replace_animation_frames
+        result = replace_animation_frames(src_bundle, asset_name, replacement_path, out_bundle, rate)
+        result.update({"animation_kind": "sprite_clip", "frame_count": result["frames"], "names": []})
+        return result
     frames, durations, _ = _read_replacement(replacement_path, rate)
     sampled = _resample_indices(durations, len(rows))
     for index, (name, _, data) in enumerate(rows):

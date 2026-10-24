@@ -9,10 +9,18 @@ from .animation import MAX_FILE_BYTES, _atomic_save, _load_bundle, _release_read
 from .clip_preview import _read_clip, _render_data
 
 
-def _atlas_details(env, name: str):
+class _ClipUnreadable(Exception):
+    """AnimationClip 无法解析；只有这种情况才回退到多瓦片图集。"""
+
+
+def _atlas_details(env, name: str, frames=None):
     # Capture the bundle's own objects before dereferencing external pointers.
     local_objects = {(id(obj.assets_file), obj.path_id) for obj in env.objects}
-    frames, _, _, _ = _read_clip(env, name)
+    if frames is None:
+        try:
+            frames, _, _, _ = _read_clip(env, name)
+        except Exception as exc:
+            raise _ClipUnreadable(str(exc)) from exc
     textures = {}
     for frame in frames:
         if frame is None:
@@ -45,10 +53,35 @@ def _atlas_details(env, name: str):
     }
 
 
+def _resolve_atlas(env, name: str):
+    """优先按 AnimationClip 解析；读不出 clip 时回退到多瓦片图集。
+
+    回退只影响「clip 无法解析」的动画；多图集、独立 alpha 图集等
+    明确拒绝的动画保持原样，不会因为回退而被放行。
+    """
+    try:
+        return _atlas_details(env, name)
+    except _ClipUnreadable as exc:
+        from .frame_atlas import atlas_details
+
+        try:
+            texture, details = atlas_details(env, name)
+        except ValueError:
+            raise ValueError(str(exc)) from None
+        details["fallback_reason"] = str(exc)
+        return texture, details
+
+
 @_release_readers
 def inspect_clip_atlas(bundle_path: str | Path, name: str) -> dict:
     try:
-        _, details = _atlas_details(_load_bundle(bundle_path), name)
+        _, details = _resolve_atlas(_load_bundle(bundle_path), name)
+        if details.get("fallback_reason"):
+            details["notice"] = (
+                "AnimationClip 无法按常规方式解析，已识别为多瓦片图集："
+                f"{details.get('frames', 0)} 帧 / {details.get('tiles', 0)} 块。"
+                "可逐帧导入 PNG 帧目录或 GIF，也可按原布局导入整张图集。"
+            )
         return details
     except Exception as exc:
         return {"atlas_name": "", "atlas_width": 0, "atlas_height": 0,
@@ -80,7 +113,7 @@ def replace_clip_atlas_checked(src_bundle: str | Path, name: str, image_path: st
                                out_bundle: str | Path) -> str:
     """预览和保存共用校验；拒绝导入时不创建或改写输出包。"""
     env = _load_bundle(src_bundle)
-    texture, details = _atlas_details(env, name)
+    texture, details = _resolve_atlas(env, name)
     image = _read_atlas_image(image_path, details)
     try:
         _set_image(texture, image)
@@ -88,7 +121,7 @@ def replace_clip_atlas_checked(src_bundle: str | Path, name: str, image_path: st
         image.close()
 
     def validate(saved):
-        saved_texture, saved_details = _atlas_details(saved, name)
+        saved_texture, saved_details = _resolve_atlas(saved, name)
         if saved_details != details or saved_texture.image.size != (details["atlas_width"], details["atlas_height"]):
             raise ValueError("图集写回校验失败，作品集未修改。")
 
