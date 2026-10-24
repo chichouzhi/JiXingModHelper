@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -487,3 +488,27 @@ def _validate(env, texture_name: str, frame_count: int, size: tuple[int, int]) -
     saved_texture = _texture_of(env, texture_name).read()
     if (int(saved_texture.m_Width), int(saved_texture.m_Height)) != size:
         raise ValueError("写回校验失败：图集尺寸发生变化")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """命令行入口：一条命令完成逐帧写回并回读校验。"""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m astral_party_auto.modkit.frame_atlas",
+        description="多瓦片图集逐帧替换：把 GIF/APNG/WebP 或 PNG 帧目录写回动画图集。",
+    )
+    parser.add_argument("--bundle", required=True, type=Path, help="原始或草稿资源包")
+    parser.add_argument("--anim", required=True, help="动画名，例如 Idle、Walk-Back")
+    parser.add_argument("--frames", required=True, type=Path, help="GIF/APNG/WebP 文件或 PNG 帧目录")
+    parser.add_argument("--out", required=True, type=Path, help="输出的新资源包")
+    parser.add_argument("--fps", type=float, default=30.0, help="PNG 帧目录的预览帧率（默认 30）")
+    args = parser.parse_args(argv)
+    result = replace_animation_frames(args.bundle, args.anim, args.frames, args.out, args.fps)
+    result = {**result, "out": str(args.out), "bytes": args.out.stat().st_size}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

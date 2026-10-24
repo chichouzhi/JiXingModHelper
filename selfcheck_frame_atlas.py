@@ -11,7 +11,10 @@ import base64
 import hashlib
 import io
 import json
+import os
 import struct
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -382,6 +385,25 @@ class FrameAtlasChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "整张图集"):
             replace_clip_atlas_checked(self.bundle, ANIM_NAME, small, out)
         self.assertFalse(out.exists())
+
+    def test_command_line_replaces_and_validates(self):
+        out = self.root / "cli.bundle"
+        root = Path(__file__).resolve().parent
+        environment = dict(os.environ, PYTHONPATH=str(root))
+        process = subprocess.run(
+            [sys.executable, "-m", "astral_party_auto.modkit.frame_atlas",
+             "--bundle", str(self.bundle), "--anim", ANIM_NAME,
+             "--frames", str(self.folder), "--out", str(out)],
+            cwd=root, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=environment,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        payload = json.loads(process.stdout)
+        self.assertEqual(payload["frames"], FRAME_COUNT)
+        self.assertEqual(payload["texture"], TEXTURE_NAME)
+        self.assertEqual(payload["out"], str(out))
+        self.assertTrue(out.is_file())
+        self.assertEqual(frame_atlas.inspect_texture(out, TEXTURE_NAME)["frames"], FRAME_COUNT)
 
     def test_frame_source_detection(self):
         self.assertTrue(frame_atlas.is_frame_source(self.gif))
