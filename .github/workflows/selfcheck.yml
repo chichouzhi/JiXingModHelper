@@ -57,6 +57,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python selfcheck_clip_atlas.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python selfcheck_frame_atlas.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check frontend syntax
         shell: pwsh
