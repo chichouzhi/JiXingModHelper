@@ -885,7 +885,15 @@ class DesktopApi:
         if key not in self._animation_cache:
             if kind == "sprite_clip":
                 from .modkit.clip_preview import read_clip_preview
-                result = read_clip_preview(path, name)
+                try:
+                    result = read_clip_preview(path, name)
+                except ValueError as exc:
+                    # clip 无法解析时回退到多瓦片图集的逐帧反拼。
+                    from .modkit.frame_atlas import read_frames_preview
+                    try:
+                        result = read_frames_preview(path, name, fps)
+                    except ValueError:
+                        raise exc from None
             elif kind == "cri_usm":
                 from .modkit.cri_video import read_cri_video_preview
                 result = read_cri_video_preview(path, name, work_dir=DATA_DIR / "skill-video-preview")
@@ -913,7 +921,8 @@ class DesktopApi:
             kind = selection.get("animation_kind") or "sequence"
         else:
             item = next((x for x in self.controller.draft_items if x.get("bundle") == bundle and x.get("name") == name), {})
-            kind = "sprite_clip" if item.get("kind") == "anim" else item.get("animation_kind", "sequence")
+            kind = ("sprite_clip" if item.get("kind") == "anim" or item.get("from_anim")
+                    else item.get("animation_kind", "sequence"))
         return self._animation_preview(path, name, kind, fps)
 
     def _clip_candidate_preview(self, selection: dict, replacement: Path) -> dict:
@@ -921,12 +930,17 @@ class DesktopApi:
         from .modkit.clip_preview import read_clip_preview
         from .modkit.clip_edit import replace_clip_checked
         from .modkit.clip_atlas import replace_clip_atlas_checked
+        from .modkit.frame_atlas import is_frame_source
 
         original = Path(selection.get("original_path") or selection["bundle_path"])
         draft = self.controller._draft_dir() / selection["bundle"]
         source = draft if draft.exists() else original
         with tempfile.TemporaryDirectory(prefix="jixing-clip-preview-") as folder:
             temporary = Path(folder) / "candidate.bundle"
+            if selection.get("frame_atlas") and is_frame_source(replacement):
+                from .modkit.frame_atlas import read_frames_preview, replace_animation_frames
+                replace_animation_frames(source, selection["name"], replacement, temporary)
+                return read_frames_preview(temporary, selection["name"])
             if replacement.suffix.lower() in {".animbin", ".bin"}:
                 if replacement.stat().st_size > 32 * 1024 * 1024:
                     raise RuntimeError("动画数据超过 32 MB。")
@@ -936,9 +950,14 @@ class DesktopApi:
             try:
                 return read_clip_preview(temporary, selection["name"])
             except ValueError as exc:
-                if replacement.suffix.lower() not in {".animbin", ".bin"}:
-                    raise
-                return {"frames": [], "durations": [], "total": 0, "notice": f"替换文件可以读取，但无法播放：{exc}"}
+                if replacement.suffix.lower() in {".animbin", ".bin"}:
+                    return {"frames": [], "durations": [], "total": 0, "notice": f"替换文件可以读取，但无法播放：{exc}"}
+                # 多瓦片图集的 clip 无法解析时，用图集反拼预览整张替换结果。
+                from .modkit.frame_atlas import read_frames_preview
+                try:
+                    return read_frames_preview(temporary, selection["name"])
+                except ValueError:
+                    raise exc from None
 
     @exposed
     def get_sequence_frames(self, bundle: str, name: str) -> dict:
@@ -1255,7 +1274,13 @@ class DesktopApi:
             self._clear_replacement()
         if not selection.get("editable", True):
             raise RuntimeError(selection.get("reason") or "此资源暂不支持替换。")
-        if asset_type in ("texture", "anim"):
+        frame_atlas = bool(selection.get("frame_atlas"))
+        if asset_type == "anim" and frame_atlas:
+            file_types = (
+                "逐帧素材或整张图集 (*.gif;*.apng;*.webp;*.png;*.jpg;*.jpeg;*.bmp;*.animbin;*.bin)",
+                "所有文件 (*.*)",
+            )
+        elif asset_type in ("texture", "anim"):
             file_types = (
                 "图片或动画字节 (*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.animbin;*.bin)",
                 "所有文件 (*.*)",
@@ -1266,8 +1291,10 @@ class DesktopApi:
             file_types = ("文本文件 (*.txt;*.json;*.xml;*.csv;*.bytes)", "所有文件 (*.*)")
         else:
             raise RuntimeError("当前类型不需要选择替换文件。")
-        if sequence_folder and not (asset_type == "dynamic" and selection.get("animation_kind") == "sequence"):
-            raise RuntimeError("只有序列帧动画可以选择帧图文件夹。")
+        folder_allowed = ((asset_type == "dynamic" and selection.get("animation_kind") == "sequence")
+                          or (asset_type == "anim" and frame_atlas))
+        if sequence_folder and not folder_allowed:
+            raise RuntimeError("只有序列帧或多瓦片图集动画可以选择帧图文件夹。")
         path = self._pick_path("folder" if sequence_folder else "open", file_types=file_types)
         if selection_key != self._emote_selection_key():
             self._clear_replacement()
@@ -1338,7 +1365,12 @@ class DesktopApi:
             source = selection.get("original_path") or selection.get("bundle_path")
             animation = read_adapted_replacement(source, selection["name"], path, kind=selection["animation_kind"])
         elif asset_type == "anim":
-            animation = self._clip_candidate_preview(selection, path)
+            from .modkit.frame_atlas import is_frame_source, read_adapted_frames
+            if selection.get("frame_atlas") and is_frame_source(path):
+                source = selection.get("original_path") or selection.get("bundle_path")
+                animation = read_adapted_frames(source, selection["name"], path)
+            else:
+                animation = self._clip_candidate_preview(selection, path)
         elif asset_type == "texture":
             from .modkit.maker import read_static_image
             try:
@@ -1454,7 +1486,15 @@ class DesktopApi:
                 )
             elif asset_type == "anim":
                 try:
-                    if replacement.suffix.lower() in {".animbin", ".bin"}:
+                    from .modkit.frame_atlas import is_frame_source
+                    if selection.get("frame_atlas") and is_frame_source(replacement):
+                        item = self.controller.add_anim_to_draft(
+                            source,
+                            selection["name"],
+                            frames_path=replacement,
+                            bundle_name=selection["bundle"],
+                        )
+                    elif replacement.suffix.lower() in {".animbin", ".bin"}:
                         item = self.controller.add_anim_to_draft(
                             source,
                             selection["name"],

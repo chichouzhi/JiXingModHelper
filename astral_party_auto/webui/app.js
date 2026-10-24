@@ -1066,6 +1066,10 @@ ${row.bundle}`;
 
   function animationImportNotice(selection) {
     const dataNotice = "同源 .animbin 用于修改动作数据；替换图集不改变动作顺序和时间。";
+    if (selection.frame_atlas) {
+      const atlas = `${selection.atlas_name} · ${selection.atlas_width} × ${selection.atlas_height} 像素`;
+      return `多瓦片图集：${atlas}，共 ${selection.frames} 帧 / ${selection.tiles} 块。\n可导入 GIF、APNG、动画 WebP，或点「选择 PNG 帧文件夹…」逐帧写回；帧数不同会均匀取样，游戏内播放时序不变。也可继续导入保持原布局的整张图集。\n${dataNotice}`;
+    }
     if (selection.atlas_editable !== true) {
       return `${selection.atlas_reason || "此动画没有可直接替换的单张原图集。"} 此处只能导入同源 .animbin。`;
     }
@@ -1094,7 +1098,9 @@ ${row.bundle}`;
     if (hint) hint.textContent = state.replacementImporting ? "正在读取替换文件，请稍候…"
       : !supportsDrop ? "当前资源请使用上方的动画制作入口或下方选择文件按钮。"
       : kind === "text" ? "拖入一个文本文件，单个不超过 12 MiB；也可点击下方导入文本文件。"
-      : kind === "anim" ? "拖入同源 .animbin，或保持原布局的完整图集，单个不超过 12 MiB。"
+      : kind === "anim" ? (selection?.frame_atlas
+        ? "拖入 GIF / APNG / 动画 WebP（单个不超过 12 MiB），或用下方「选择 PNG 帧文件夹」；也可拖入同源 .animbin。"
+        : "拖入同源 .animbin，或保持原布局的完整图集，单个不超过 12 MiB。")
       : "拖入一张静态图片，单个不超过 12 MiB；动图和视频请用上方专用入口。";
   }
 
@@ -1260,6 +1266,7 @@ ${row.bundle}`;
     const editable = canEdit(sel);
     const animated = isPlayableAnimation(sel);
     const sequence = isSequenceAnimation(sel);
+    const frameAtlas = !!sel.frame_atlas;
     $("#studio-image-mode").classList.toggle("is-hidden", kind === "text");
     $("#studio-image-mode").classList.toggle("is-readonly", !editable);
     $("#studio-replacement-card")?.classList.toggle("is-hidden", !editable);
@@ -1269,16 +1276,19 @@ ${row.bundle}`;
     $("#studio-original-heading").textContent = sel.emote ? "原静态封面" : "游戏原内容";
     $("#studio-replacement-heading").textContent = sel.emote ? "你的封面图片" : "你的替换文件";
     $("#choose-replacement").classList.toggle("is-hidden", !editable);
-    $("#choose-frame-folder").classList.toggle("is-hidden", !editable || !sequence);
+    $("#choose-frame-folder").classList.toggle("is-hidden", !editable || !(sequence || frameAtlas));
+    $("#choose-frame-folder").textContent = "选择 PNG 帧文件夹…";
     $("#choose-replacement").textContent = kind === "text" ? "导入文本文件…" : kind === "anim"
-      ? sel.atlas_editable === true ? "选择同源动画 / 整张图集…" : "选择同源动画…"
+      ? frameAtlas ? "选择 GIF / 整张图集…" : sel.atlas_editable === true ? "选择同源动画 / 整张图集…" : "选择同源动画…"
       : animated ? "选择替换动画…" : sel.emote ? "更换静态封面…" : "选择替换文件";
     $("#commit-replacement").textContent = sel.emote ? "保存封面到作品集" : "保存到作品集";
     syncStudioImportControls();
     $("#animation-settings").classList.toggle("is-hidden", !animated);
     $("#sequence-fps-label").classList.toggle("is-hidden", !sequence);
     $("#animation-guidance").textContent = kind === "anim"
-      ? "按动画片段中的 Sprite 引用顺序和时间播放，可暂停、逐帧查看和调节播放倍速。"
+      ? frameAtlas
+        ? "AnimationClip 无法按单轨播放，已改用多瓦片图集：可导入 GIF 或 PNG 帧目录，按原帧数和时序写回。"
+        : "按动画片段中的 Sprite 引用顺序和时间播放，可暂停、逐帧查看和调节播放倍速。"
       : !editable ? "当前资源可逐帧查看。替换能力和限制见下方说明。" : sequence
       ? "导入 GIF、WebP 或 APNG 后按原序列帧数量和尺寸适配。此处帧率用于预览，游戏内速度由游戏控制。"
       : "保留动画图片的逐帧时长，可逐帧检查替换前后效果。";
@@ -1354,7 +1364,9 @@ ${row.bundle}`;
       renderAnimation(media, replacement.animation, isSequenceAnimation(state.selection));
     } else {
       const clip = (state.selection?.asset_type || state.selection?.kind) === "anim";
-      const empty = clip ? state.selection.atlas_editable === true
+      const empty = clip ? state.selection.frame_atlas
+        ? "尚未导入替换。可选择 GIF / PNG 帧目录逐帧导入，或按原布局导入整张图集。"
+        : state.selection.atlas_editable === true
         ? "尚未导入替换。请选择同源 .animbin，或按原布局修改的整张图集。"
         : "尚未导入替换。请选择同源 .animbin 动画数据。"
         : "选择文件后可在这里对照预览";

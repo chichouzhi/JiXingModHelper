@@ -730,15 +730,22 @@ class ModController:
 
             clip = inspect_clip_preview(path, asset_name)
             atlas = inspect_clip_atlas(path, asset_name)
-            playable = bool(clip.get("playable"))
+            frame_atlas = bool(atlas.get("frame_atlas"))
+            playable = bool(clip.get("playable")) or frame_atlas
             preview_tex = atlas.get("atlas_name") or find_anim_preview_texture(path, asset_name)
             png = None
             width, height = clip.get("width", 0), clip.get("height", 0)
-            if not playable and preview_tex:
+            if frame_atlas:
+                width, height = atlas.get("first_frame_size", (width, height))
+            elif not playable and preview_tex:
                 png, info = self.preview_bundle(path, preview_tex, tag="animprev", force=force)
                 if info:
                     width, height = info.width, info.height
             reason = clip.get("reason") or "按原动画关键帧播放。"
+            if frame_atlas and not clip.get("playable"):
+                reason = (f"AnimationClip 无法按单轨播放（{clip.get('reason')}）；"
+                          f"已识别为多瓦片图集：{atlas.get('frames')} 帧 / {atlas.get('tiles')} 块，可逐帧替换。")
+            total_frames = clip.get("total") or atlas.get("frames", 0)
             self.selection = {
                 "kind": "anim", "asset_type": "anim", "editable": True,
                 "playable": playable,
@@ -754,7 +761,7 @@ class ModController:
                 "preview": str(png) if png else "",
                 "text_preview": reason,
                 "category": "all", "category_label": "动画",
-                "category_desc": f"2D 动画 · {clip.get('total', 0)} 帧 · 按原时序播放" if playable else "动画暂不支持播放；下图仅为静态参考",
+                "category_desc": f"2D 动画 · {total_frames} 帧 · 按原时序播放" if playable else "动画暂不支持播放；下图仅为静态参考",
                 "caption": f"动画 · {asset_name}",
             }
             return self.selection
@@ -1128,15 +1135,21 @@ class ModController:
         src = out_bundle if out_bundle.exists() else base
         if item.get("from_anim"):
             from .modkit.clip_atlas import inspect_clip_atlas, replace_clip_atlas_checked
+            from .modkit.frame_atlas import is_frame_source, replace_animation_frames
 
             if crop_box is not None:
                 raise RuntimeError("动画完整图集不能裁剪，请保留原图集尺寸和布局。")
-            atlas = inspect_clip_atlas(src, item["from_anim"])
-            if not atlas["atlas_editable"]:
-                raise RuntimeError(atlas["atlas_reason"])
-            if atlas["atlas_name"] != item.get("name"):
-                raise RuntimeError("作品集记录的图集与动画引用不一致，请移除此项后重新选择资源。")
-            replaced = replace_clip_atlas_checked(src, item["from_anim"], image_path, out_bundle)
+            if is_frame_source(image_path):
+                replaced = replace_animation_frames(
+                    src, item["from_anim"], image_path, out_bundle
+                )["texture"]
+            else:
+                atlas = inspect_clip_atlas(src, item["from_anim"])
+                if not atlas["atlas_editable"]:
+                    raise RuntimeError(atlas["atlas_reason"])
+                if atlas["atlas_name"] != item.get("name"):
+                    raise RuntimeError("作品集记录的图集与动画引用不一致，请移除此项后重新选择资源。")
+                replaced = replace_clip_atlas_checked(src, item["from_anim"], image_path, out_bundle)
         else:
             replaced = replace_bundle_texture(
                 src, image_path, out_bundle, target_name=item.get("name"), crop_box=crop_box
@@ -1419,12 +1432,13 @@ class ModController:
         anim_name: str,
         *,
         image_path: str | Path | None = None,
+        frames_path: str | Path | None = None,
         raw_path: str | Path | None = None,
         preview_texture: str | None = None,
         crop_box: tuple[int, int, int, int] | None = None,
         bundle_name: str | None = None,
     ) -> dict:
-        """动画替换：完整静态图集需保留原布局；.animbin 需同源兼容。"""
+        """动画替换：.animbin 需同源；图集可整张导入，多瓦片图集可逐帧导入。"""
         self._require_game()
         bundle_path = Path(bundle_path)
         bundle_name = Path(bundle_name).name if bundle_name else logical_bundle_name(bundle_path)
@@ -1443,6 +1457,7 @@ class ModController:
         else:
             raise RuntimeError(f"找不到资源包：{bundle_name}")
         src = out_bundle if out_bundle.exists() else base
+        from .modkit.frame_atlas import is_frame_source
 
         if raw_path:
             raw = Path(raw_path).read_bytes()
@@ -1452,6 +1467,25 @@ class ModController:
                 "bundle": out_bundle.name,
                 "name": replaced,
                 "note": f"动画数据 ← {Path(raw_path).name}",
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
+        elif frames_path or (image_path and is_frame_source(image_path)):
+            from .modkit.frame_atlas import replace_animation_frames
+
+            source = frames_path or image_path
+            if crop_box:
+                raise RuntimeError("逐帧素材按瓦片布局写回，不能裁剪。")
+            result = replace_animation_frames(src, anim_name, source, out_bundle)
+            tex = result["texture"]
+            self._check_sequence_overlap(bundle_name, [tex], "texture", tex)
+            item = {
+                "kind": "texture",
+                "bundle": out_bundle.name,
+                "name": tex,
+                "note": f"动画 {anim_name} 逐帧 ← {Path(source).name}",
+                "from_anim": anim_name,
+                "frame_atlas": True,
+                "frames": result["frames"],
                 "at": datetime.now().isoformat(timespec="seconds"),
             }
         elif image_path:
@@ -1471,8 +1505,13 @@ class ModController:
                 "name": replaced_tex,
                 "note": f"动画 {anim_name} 关联图集 ← {Path(image_path).name}",
                 "from_anim": anim_name,
+                "frame_atlas": bool(atlas.get("frame_atlas")),
                 "at": datetime.now().isoformat(timespec="seconds"),
             }
+        else:
+            raise RuntimeError("请提供替换图片、逐帧素材，或 .animbin 动画字节文件。")
+
+        if item["kind"] == "texture":
             # 去重按贴图名
             self.draft_items = [
                 x
@@ -1485,10 +1524,8 @@ class ModController:
             ]
             self.draft_items.append(item)
             self._save_draft()
-            self.log(f"已加入作品集（动画预览图）：{anim_name} → {replaced_tex}")
+            self.log(f"已加入作品集（动画图集）：{anim_name} → {item['name']}")
             return item
-        else:
-            raise RuntimeError("请提供替换图片，或 .animbin 动画字节文件。")
 
         self.draft_items = [
             x

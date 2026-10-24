@@ -13,7 +13,7 @@ IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 _SUFFIXES = {
     "texture": IMAGE_SUFFIXES,
     "text": frozenset({".txt", ".json", ".xml", ".csv", ".bytes"}),
-    "anim": IMAGE_SUFFIXES | {".animbin", ".bin"},
+    "anim": IMAGE_SUFFIXES | {".animbin", ".bin", ".gif"},
 }
 
 
@@ -49,7 +49,7 @@ def stage_dropped_file(filename: str, content_base64: str, asset_type: str, cach
             try:
                 with Image.open(path) as image:
                     expected_format = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
-                                       ".webp": "WEBP", ".bmp": "BMP"}[suffix]
+                                       ".webp": "WEBP", ".bmp": "BMP", ".gif": "GIF"}[suffix]
                     if image.format != expected_format:
                         raise ValueError("图片内容与文件后缀不符，请用图片软件另存为 PNG 后再拖入。")
                     if image.width * image.height > MAX_DROPPED_IMAGE_PIXELS:
