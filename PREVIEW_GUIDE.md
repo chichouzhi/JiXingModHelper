@@ -37,6 +37,14 @@ GIF、APNG、动态 WebP 和视频请使用相应的动画、动态表情或动�
 
 **体积与格式。** 写回会保留原贴图格式（本游戏为 BC7）并沿用原资源包的压缩方式。实测 101 的 `Idle`（60 帧、3168×3168）输出约 23 MB，和原包 24 MB 基本持平；不会再出现未压缩 RGBA 的 100 MB 级膨胀。单个资源包超过 40 MB 时请减少同包动作或先检查素材。
 
+**一条命令写回（脚本 / 命令行）。** 也可以不打开界面，直接对资源包执行并回读校验：
+
+```powershell
+python -m astral_party_auto.modkit.frame_atlas --bundle "Hero101_Controller.bundle" --anim Idle --frames "frames\idle.gif" --out "Idle.bundle"
+```
+
+`--frames` 接受 GIF、APNG、动画 WebP 或 PNG 帧目录；输出 JSON 包含贴图名、目标帧数、图集尺寸和输出字节数。源包只读，输出写入新文件。
+
 **支持 / 不支持边界**
 
 - 支持：一个动画对应一张图集；瓦片无旋转、无翻转、互不重叠；GIF / APNG / 动画 WebP / PNG 帧目录；整张图集替换。
