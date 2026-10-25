@@ -386,6 +386,26 @@ class FrameAtlasChecks(unittest.TestCase):
             replace_clip_atlas_checked(self.bundle, ANIM_NAME, small, out)
         self.assertFalse(out.exists())
 
+    def test_compose_grid_writes_dense_mesh_quads(self):
+        quads = tuple(
+            frame_atlas.Quad(
+                (column * 8, row * 8, (column + 1) * 8, (row + 1) * 8),
+                (column / 8, row / 8, (column + 1) / 8, (row + 1) / 8),
+            )
+            for row in range(8) for column in range(8)
+        )
+        frame = frame_atlas.Frame("grid", 0, (0.0, 0.0, 64.0, 64.0), quads)
+        atlas = frame_atlas.compose_grid(
+            [frame], [Image.new("RGBA", (64, 64), (255, 0, 0, 255))], (64, 64)
+        )
+        self.assertEqual(atlas.getpixel((4, 4)), (255, 0, 0, 255))
+        self.assertEqual(atlas.getpixel((60, 60)), (255, 0, 0, 255))
+
+    def test_analyze_frames_detects_tile_layout(self):
+        frames, tile = frame_atlas.analyze_frames(_load_bundle(self.bundle), TEXTURE_NAME)
+        self.assertTrue(tile)
+        self.assertEqual(len(frames), FRAME_COUNT)
+
     def test_command_line_replaces_and_validates(self):
         out = self.root / "cli.bundle"
         root = Path(__file__).resolve().parent
