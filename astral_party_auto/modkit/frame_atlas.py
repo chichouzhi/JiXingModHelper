@@ -256,10 +256,121 @@ def _is_blank(tile: Image.Image) -> bool:
 
 
 def _pick_index(image_count: int, index: int, frame_count: int) -> int:
-    """帧数与图片数不同时按顺序均匀取样；图片不足时循环使用。"""
-    if image_count >= frame_count:
-        return min(image_count - 1, round(index * (image_count - 1) / max(1, frame_count - 1)))
-    return index % image_count
+    """把第 index 个目标帧映射到素材帧：多则抽帧，少则每张保持若干帧。"""
+    if frame_count <= 0:
+        return 0
+    return min(image_count - 1, ((2 * index + 1) * image_count) // (2 * frame_count))
+
+
+def _fit_frame(source: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """等比缩放后底部居中放入目标帧，避免把角色拉扁。"""
+    width, height = size
+    scale = min(width / max(1, source.width), height / max(1, source.height))
+    new_width = max(1, min(width, round(source.width * scale)))
+    new_height = max(1, min(height, round(source.height * scale)))
+    resized = source.resize((new_width, new_height), Image.LANCZOS)
+    if (new_width, new_height) == (width, height):
+        return resized
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    canvas.alpha_composite(resized, ((width - new_width) // 2, height - new_height))
+    resized.close()
+    return canvas
+
+
+def _placeholder_tiles(frames: list[Frame], size: tuple[int, int],
+                       original: Image.Image) -> set[tuple[int, int, int, int]]:
+    """找出复用率最高的透明占位格；角色没覆盖到的普通空白格不应跳过。"""
+    from collections import Counter
+
+    width, height = size
+    counts: Counter[tuple[int, int, int, int]] = Counter()
+    for frame in frames:
+        for _rect, (u0, v0, u1, v1) in _tile_rects(frame):
+            ax0, ax1 = round(u0 * width), round(u1 * width)
+            ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
+            if ax1 <= ax0 or ay1 <= ay0:
+                continue
+            key = (ax0, ay0, ax1, ay1)
+            if _is_blank(original.crop(key)):
+                counts[key] += 1
+    if not counts:
+        return set()
+    top = max(counts.values())
+    threshold = max(1, len(frames) // 3)
+    return {key for key, count in counts.items() if count == top and count >= threshold}
+
+
+def _safe_bbox(frames: list[Frame], size: tuple[int, int],
+               placeholders: set[tuple[int, int, int, int]]) -> tuple[float, float, float, float] | None:
+    """可写区域的本地包围盒：排除透明占位格后，角色真正占据的范围。
+
+    Fight-move 这类动作的帧画布比角色宽，左侧大片是占位格；直接按整帧
+    缩放会把角色压小并裁掉一半。
+    """
+    width, height = size
+    left = top = float("inf")
+    right = bottom = float("-inf")
+    for frame in frames:
+        for (l, t, r, b), (u0, v0, u1, v1) in _tile_rects(frame):
+            ax0, ax1 = round(u0 * width), round(u1 * width)
+            ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
+            if (ax0, ay0, ax1, ay1) in placeholders:
+                continue
+            left, top = min(left, l), min(top, t)
+            right, bottom = max(right, r), max(bottom, b)
+    if left == float("inf"):
+        return None
+    return (left, top, right, bottom)
+
+
+def _placeholder_rects(frame: Frame, size: tuple[int, int],
+                       placeholders: set[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    """当前帧里占位格的像素矩形；不同帧的占位位置可能不同，必须逐帧判断。"""
+    width, height = size
+    rects: set[tuple[int, int, int, int]] = set()
+    for (l, t, r, b), (u0, v0, u1, v1) in _tile_rects(frame):
+        ax0, ax1 = round(u0 * width), round(u1 * width)
+        ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
+        if (ax0, ay0, ax1, ay1) in placeholders:
+            rects.add((l, t, r, b))
+    return sorted(rects)
+
+
+def _fit_without_collision(source: Image.Image, safe: tuple[int, int, int, int],
+                           blockers: list[tuple[int, int, int, int]]):
+    """在不盖到透明占位格的前提下，尽量放大素材（优先居中，其次左/右对齐）。"""
+    safe_left, safe_top, safe_right, safe_bottom = safe
+    safe_width = max(1, safe_right - safe_left)
+    safe_height = max(1, safe_bottom - safe_top)
+    scale = 1.0
+    while scale >= 0.2:
+        width = max(1, round(safe_width * scale))
+        height = max(1, round(safe_height * scale))
+        fitted = _fit_frame(source, (width, height))
+        alpha = fitted.getchannel("A")
+        for place_x in (safe_left + (safe_width - width) // 2,
+                        safe_left, safe_right - width):
+            place_y = safe_bottom - height
+            collision = False
+            for (l, t, r, b) in blockers:
+                ix0, iy0 = max(l, place_x), max(t, place_y)
+                ix1, iy1 = min(r, place_x + width), min(b, place_y + height)
+                if ix1 <= ix0 or iy1 <= iy0:
+                    continue
+                crop = alpha.crop((ix0 - place_x, iy0 - place_y, ix1 - place_x, iy1 - place_y))
+                # BC7 的透明区域会有 1~3 级 alpha 噪点，不能当成实体像素。
+                if crop.getextrema()[1] > 8:
+                    collision = True
+                    crop.close()
+                    break
+                crop.close()
+            if not collision:
+                alpha.close()
+                return fitted, place_x, place_y
+        alpha.close()
+        fitted.close()
+        scale -= 0.04
+    return None
 
 
 def compose(
@@ -271,36 +382,65 @@ def compose(
     """把每帧图片按瓦片布局写回一张同尺寸图集。
 
     规则：
-      - 原始图集里是空白的瓦片直接跳过，避免在动画里留下残影块；
+      - 只跳过复用率最高的透明占位格，避免残影；角色没覆盖到的普通空白格照常写入；
       - 同一个图集区域只写一次，防止多帧互相覆盖；
-      - 帧数与图片数不同时按顺序均匀取样，图片不足时循环使用。
+      - 帧数与图片数不同时均匀取样：素材多则抽帧，素材少则每张保持若干帧；
+      - 素材等比缩放、底部居中，不拉伸变形。
     """
     if not images:
         raise ValueError("没有可用的替换帧")
     width, height = size
     _size_limit(width, height)
+    placeholders = _placeholder_tiles(frames, size, original) if original is not None else set()
+    safe = _safe_bbox(frames, size, placeholders) if placeholders else None
+    if safe is None:
+        x0, y0, x1, y1 = frames[0].bbox
+        safe = (0, 0, x1 - x0, y1 - y0)
+    safe = (round(safe[0]), round(safe[1]), round(safe[2]), round(safe[3]))
+    fallback_width = max(1, safe[2] - safe[0])
+    fallback_height = max(1, safe[3] - safe[1])
     atlas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     written: set[tuple[int, int, int, int]] = set()
     for index, frame in enumerate(frames):
         source = images[_pick_index(len(images), index, len(frames))].convert("RGBA")
-        x0, y0, x1, y1 = frame.bbox
-        frame_width = max(1, round(x1 - x0))
-        frame_height = max(1, round(y1 - y0))
-        source = source.resize((frame_width, frame_height), Image.LANCZOS)
-        for (left, top, right, bottom), (u0, v0, u1, v1) in _tile_rects(frame):
-            ax0, ax1 = round(u0 * width), round(u1 * width)
-            ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
-            if ax1 <= ax0 or ay1 <= ay0:
-                continue
-            key = (ax0, ay0, ax1, ay1)
-            if key in written:
-                continue
-            written.add(key)
-            if original is not None and _is_blank(original.crop(key)):
-                continue
-            tile = source.crop((left, top, right, bottom))
-            tile = tile.resize((ax1 - ax0, ay1 - ay0), Image.LANCZOS)
-            atlas.alpha_composite(tile, (ax0, ay0))
+        blockers = _placeholder_rects(frame, size, placeholders) if placeholders else []
+        placed = _fit_without_collision(source, safe, blockers) if blockers else None
+        if placed is None:
+            fitted = _fit_frame(source, (fallback_width, fallback_height))
+            place_x, place_y = safe[0], safe[1]
+        else:
+            fitted, place_x, place_y = placed
+        source.close()
+        try:
+            for (left, top, right, bottom), (u0, v0, u1, v1) in _tile_rects(frame):
+                ax0, ax1 = round(u0 * width), round(u1 * width)
+                ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
+                if ax1 <= ax0 or ay1 <= ay0:
+                    continue
+                key = (ax0, ay0, ax1, ay1)
+                if key in written or key in placeholders:
+                    continue
+                # 素材边缘可能只覆盖瓦片的一部分：只写交集，避免整块裁掉或拉伸。
+                cx0, cy0 = max(left, place_x), max(top, place_y)
+                cx1 = min(right, place_x + fitted.width)
+                cy1 = min(bottom, place_y + fitted.height)
+                if cx1 <= cx0 or cy1 <= cy0:
+                    continue
+                written.add(key)
+                tile_width = max(1, right - left)
+                tile_height = max(1, bottom - top)
+                tx0 = round(ax0 + (cx0 - left) / tile_width * (ax1 - ax0))
+                tx1 = round(ax0 + (cx1 - left) / tile_width * (ax1 - ax0))
+                ty0 = round(ay0 + (cy0 - top) / tile_height * (ay1 - ay0))
+                ty1 = round(ay0 + (cy1 - top) / tile_height * (ay1 - ay0))
+                if tx1 <= tx0 or ty1 <= ty0:
+                    continue
+                tile = fitted.crop((cx0 - place_x, cy0 - place_y, cx1 - place_x, cy1 - place_y))
+                tile = tile.resize((tx1 - tx0, ty1 - ty0), Image.LANCZOS)
+                atlas.alpha_composite(tile, (tx0, ty0))
+                tile.close()
+        finally:
+            fitted.close()
     return atlas
 
 
@@ -365,7 +505,7 @@ def read_adapted_frames(bundle_path: str | Path, anim_name: str,
     images, durations, _ = _read_replacement(replacement_path, rate)
     try:
         indices, sampled = _preview_indices(len(frames), [1000 / rate] * len(frames))
-        adapted = [images[_pick_index(len(images), index, len(frames))].resize(sizes[index], Image.LANCZOS)
+        adapted = [_fit_frame(images[_pick_index(len(images), index, len(frames))], sizes[index])
                    for index in indices]
         info = {
             "animation_kind": "sprite_clip", "playable": True, "editable": True,

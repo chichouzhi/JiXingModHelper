@@ -405,6 +405,33 @@ class FrameAtlasChecks(unittest.TestCase):
         self.assertTrue(out.is_file())
         self.assertEqual(frame_atlas.inspect_texture(out, TEXTURE_NAME)["frames"], FRAME_COUNT)
 
+    def test_fit_frame_keeps_aspect_and_bottom(self):
+        source = Image.new("RGBA", (100, 50), (255, 0, 0, 255))
+        fitted = frame_atlas._fit_frame(source, (40, 40))
+        self.assertEqual(fitted.size, (40, 40))
+        self.assertEqual(fitted.getchannel("A").getbbox(), (0, 20, 40, 40))
+
+    def test_pick_index_holds_and_subsamples(self):
+        self.assertEqual([frame_atlas._pick_index(5, index, 15) for index in range(15)],
+                         [0] * 3 + [1] * 3 + [2] * 3 + [3] * 3 + [4] * 3)
+        self.assertEqual([frame_atlas._pick_index(30, index, 15) for index in range(15)],
+                         list(range(1, 30, 2)))
+
+    def test_fit_avoids_placeholder_without_shrinking_transparent_area(self):
+        safe = (0, 0, 100, 100)
+        partially_transparent = Image.new("RGBA", (100, 50), (255, 0, 0, 255))
+        partially_transparent.paste(Image.new("RGBA", (50, 50), (0, 0, 0, 0)), (50, 0))
+        fitted, place_x, place_y = frame_atlas._fit_without_collision(
+            partially_transparent, safe, [(50, 0, 100, 50)])
+        self.assertEqual(fitted.size, (100, 100))
+        self.assertEqual(fitted.getchannel("A").getbbox(), (0, 50, 50, 100))
+        self.assertEqual((place_x, place_y), (0, 0))
+
+        opaque = Image.new("RGBA", (100, 50), (255, 0, 0, 255))
+        fitted, place_x, _place_y = frame_atlas._fit_without_collision(
+            opaque, safe, [(50, 0, 100, 100)])
+        self.assertLessEqual(place_x + fitted.width, 50)
+
     def test_frame_source_detection(self):
         self.assertTrue(frame_atlas.is_frame_source(self.gif))
         self.assertTrue(frame_atlas.is_frame_source(self.folder))
