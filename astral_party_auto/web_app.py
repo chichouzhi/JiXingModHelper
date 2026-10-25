@@ -1050,6 +1050,26 @@ class DesktopApi:
         return {"result": result, "draft": self._draft_state()}
 
     @exposed
+    def inspect_skin_swap(self, hero_id: str, skin_a: str, skin_b: str,
+                          portraits: bool = True) -> dict:
+        from .modkit.skin_swap import plan_swap
+
+        return plan_swap(self.controller, str(hero_id), str(skin_a), str(skin_b),
+                         portraits=bool(portraits))
+
+    @exposed
+    def apply_skin_swap(self, hero_id: str, skin_a: str, skin_b: str,
+                        portraits: bool = True, install: bool = False) -> dict:
+        from .modkit.skin_swap import swap_skins
+
+        result = swap_skins(
+            self.controller, str(hero_id), str(skin_a), str(skin_b),
+            portraits=bool(portraits), install=bool(install),
+        )
+        return {"result": result, "installed": result.get("installed", False),
+                "dashboard": self._dashboard_state() if result.get("installed") else None}
+
+    @exposed
     def set_resource_character(self, bundle: str, name: str, character: str) -> dict:
         return self.controller.set_resource_character(bundle, name, character)
 

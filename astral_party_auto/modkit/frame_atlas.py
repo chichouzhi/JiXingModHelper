@@ -394,13 +394,20 @@ def _fit_without_collision(source: Image.Image, safe: tuple[int, int, int, int],
     return None
 
 
-def _inline_all_textures(env) -> int:
-    """把仍在 .resS 里的贴图改为内嵌，便于整包重压缩并删除 resS。"""
+def _inline_all_textures(env, exclude: set[str] | None = None) -> int:
+    """把仍在 .resS 里的贴图改为内嵌，便于整包重压缩并删除 resS。
+
+    exclude 里的贴图已经由本次替换写入新像素，必须跳过；obj.read() 可能仍
+    返回带旧 StreamData 的缓存对象，再内嵌一次会把新图覆盖回原图。
+    """
+    excluded = set(exclude or ())
     count = 0
     for obj in env.objects:
         if obj.type.name != "Texture2D":
             continue
         data = obj.read()
+        if str(getattr(data, "m_Name", "")) in excluded:
+            continue
         stream = getattr(data, "m_StreamData", None)
         if not stream or int(getattr(stream, "size", 0) or 0) <= 0:
             continue
@@ -411,6 +418,27 @@ def _inline_all_textures(env) -> int:
         data.save()
         count += 1
     return count
+
+
+def _read_replacement_unbounded(path: str | Path, fps: float):
+    """内部互换用：PNG 帧目录不限制总像素，仍逐帧检查尺寸。"""
+    from .animation import _fps
+
+    source = Path(path)
+    if not source.is_dir():
+        return _read_replacement(source, fps)
+    files = sorted((file for file in source.iterdir()
+                    if file.is_file() and file.suffix.lower() == ".png"))
+    if not 2 <= len(files) <= 512:
+        raise ValueError("帧目录需要至少 2 张、最多 512 张 PNG 图片。")
+    frames = []
+    for file in files:
+        with Image.open(file) as image:
+            if image.format != "PNG" or getattr(image, "n_frames", 1) != 1:
+                raise ValueError(f"帧目录只能放静态 PNG：{file.name}")
+            _size_limit(*image.size)
+            frames.append(image.convert("RGBA"))
+    return frames, [1000 / _fps(fps)] * len(frames), "sequence"
 
 
 def _drop_unused_stream(env, *, force: bool = False) -> list[str]:
@@ -612,7 +640,9 @@ def compose_grid(
     for index, frame in enumerate(frames):
         source = images[_pick_index(len(images), index, len(frames))].convert("RGBA")
         x0, y0, x1, y1 = frame.bbox
-        source = source.resize((max(1, round(x1 - x0)), max(1, round(y1 - y0))), Image.LANCZOS)
+        fitted = _fit_frame(source, (max(1, round(x1 - x0)), max(1, round(y1 - y0))))
+        source.close()
+        source = fitted
         for (left, top, right, bottom), (u0, v0, u1, v1) in _tile_rects(frame):
             ax0, ax1 = round(u0 * width), round(u1 * width)
             ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
@@ -875,6 +905,7 @@ def replace_animation_frames_batch(
     fps: float = 30,
     packer: str = "original",
     inline_stream: bool = False,
+    unbounded_source: bool = False,
 ) -> dict:
     """一次写回同一个资源包里的多个动作，最后统一压缩和回读校验。
 
@@ -897,7 +928,10 @@ def replace_animation_frames_batch(
         frames, tile = analyze_frames(env, texture_name)
         data = _texture_of(env, texture_name).read()
         size = (int(data.m_Width), int(data.m_Height))
-        images, durations, _ = _read_replacement(replacement_path, fps)
+        images, durations, _ = (
+            _read_replacement_unbounded(replacement_path, fps)
+            if unbounded_source else _read_replacement(replacement_path, fps)
+        )
         source_counts[anim_name] = len(images)
         source_durations[anim_name] = sum(durations)
         try:
@@ -928,7 +962,7 @@ def replace_animation_frames_batch(
             _validate(saved, texture_name, frame_count, size)
 
     removed = _drop_unused_stream(env)
-    inlined = _inline_all_textures(env) if inline_stream else 0
+    inlined = _inline_all_textures(env, exclude=set(textures.values())) if inline_stream else 0
     if inline_stream and inlined:
         removed += _drop_unused_stream(env, force=True)
     _atomic_save(env, out_bundle, validate, packer=packer)
