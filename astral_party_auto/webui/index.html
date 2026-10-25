@@ -364,7 +364,11 @@
 
         <section id="page-hero" class="page">
           <article class="card">
-            <div><h2>整角色替换</h2><p>选一个角色，自动找出它在游戏里的全部皮肤；每个皮肤可一次替换核心立绘和全部局内小人动作。所有资源包都构建成功后才写入作品集。</p></div>
+            <div><h2>整角色替换</h2><p>选一个角色，自动找出它在游戏里的全部皮肤；可以导入素材替换，也可以把两个现有皮肤的外观双向互换。所有资源包都构建成功后才写入作品集或安装。</p></div>
+            <div class="action-row" id="hero-mode-row">
+              <label class="check-row"><input type="radio" name="hero-mode" value="assets" checked> 自定义素材</label>
+              <label class="check-row"><input type="radio" name="hero-mode" value="swap"> 两个皮肤互换</label>
+            </div>
             <div class="action-row">
               <label>角色 <select id="hero-id"></select></label>
               <button id="hero-scan" class="button ghost">扫描全部角色皮肤</button>
@@ -378,7 +382,7 @@
               <p id="hero-skins-hint" class="notice">先扫描，再勾选要替换的皮肤。</p>
               <div id="hero-skins" class="draft-list"></div>
             </article>
-            <article class="card">
+            <article class="card" id="hero-assets-panel">
               <h3>素材与检查</h3>
               <p class="notice">素材根目录下按 <code>角色ID/皮肤/portraits</code> 与 <code>角色ID/皮肤/actions</code> 放置；动作可用 GIF 或 PNG 帧目录，立绘用 PNG。可先生成模板再填文件。</p>
               <div class="action-row">
@@ -392,6 +396,21 @@
                 <button id="hero-apply" class="button primary" disabled>生成到作品集</button>
               </div>
               <div id="hero-report"></div>
+            </article>
+            <article class="card is-hidden" id="hero-swap-panel">
+              <h3>两个皮肤互换</h3>
+              <p class="notice">把两个现有皮肤的外观双向互换：A 显示 B 的小人帧和立绘，B 显示 A 的；各自的动作列表、控制器和音效保持不变。生成的是普通 Mod，安装时管理器会先备份原包。</p>
+              <div class="action-row">
+                <label>皮肤 A <select id="swap-a"></select></label>
+                <label>皮肤 B <select id="swap-b"></select></label>
+              </div>
+              <label class="check-row"><input id="swap-portraits" type="checkbox" checked> 同时互换立绘</label>
+              <div class="action-row">
+                <button id="swap-check" class="button ghost">检查互换</button>
+                <button id="swap-export" class="button primary" disabled>只生成 Mod</button>
+                <button id="swap-install" class="button purple" disabled>生成并安装</button>
+              </div>
+              <div id="swap-report"></div>
             </article>
           </div>
         </section>

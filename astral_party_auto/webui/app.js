@@ -248,6 +248,7 @@
     if (path) path.textContent = state.heroAssets ? `素材根目录：${state.heroAssets}` : "尚未选择素材根目录。";
     if (state.heroSkins.length) {
       renderHeroSkins();
+      syncHeroMode();
       return;
     }
     try {
@@ -256,6 +257,7 @@
       if (summary.scanned && summary.heroes?.length) {
         await loadHeroSkins(summary.heroes[0]);
       }
+      syncHeroMode();
     } catch (_) {}
   }
 
@@ -315,6 +317,7 @@
       label.append(check, name, detail);
       list.appendChild(label);
     });
+    fillSwapSelects();
   }
 
   async function chooseHeroAssets() {
@@ -434,6 +437,130 @@
     }
   }
 
+  function heroMode() {
+    return document.querySelector('input[name="hero-mode"]:checked')?.value || "assets";
+  }
+
+  function syncHeroMode() {
+    const swap = heroMode() === "swap";
+    $("#hero-assets-panel")?.classList.toggle("is-hidden", swap);
+    $("#hero-swap-panel")?.classList.toggle("is-hidden", !swap);
+    if (swap) fillSwapSelects();
+  }
+
+  function fillSwapSelects() {
+    const a = $("#swap-a");
+    const b = $("#swap-b");
+    if (!a || !b) return;
+    const currentA = a.value;
+    const currentB = b.value;
+    a.innerHTML = "";
+    b.innerHTML = "";
+    state.heroSkins.forEach((skin) => {
+      for (const select of [a, b]) {
+        const option = document.createElement("option");
+        option.value = skin.skin;
+        option.textContent = `${skin.label}（${skin.actions} 个动作）`;
+        select.appendChild(option);
+      }
+    });
+    if (state.heroSkins.some((skin) => skin.skin === currentA)) a.value = currentA;
+    if (state.heroSkins.some((skin) => skin.skin === currentB)) b.value = currentB;
+    if (a.value === b.value && state.heroSkins.length > 1) {
+      b.value = state.heroSkins.find((skin) => skin.skin !== a.value)?.skin || b.value;
+    }
+    const enabled = state.heroSkins.length >= 2;
+    $("#swap-check").disabled = !enabled;
+    $("#swap-export").disabled = true;
+    $("#swap-install").disabled = true;
+  }
+
+  function renderSwapReport(data) {
+    const report = $("#swap-report");
+    if (!report) return;
+    report.innerHTML = "";
+    const head = document.createElement("p");
+    head.className = "notice";
+    head.textContent = `${data.skin_a.label} ↔ ${data.skin_b.label}：公共动作 ${data.actions.length} 个，立绘 ${data.portraits.length} 对`;
+    report.appendChild(head);
+    const skipped = [
+      ...data.only_a.map((name) => `仅 A 有动作 ${name}`),
+      ...data.only_b.map((name) => `仅 B 有动作 ${name}`),
+      ...(data.portrait_skipped || []).map((row) => `${row.name}：${row.reason}`),
+    ];
+    if (skipped.length) {
+      const note = document.createElement("details");
+      note.className = "hero-plan";
+      const summary = document.createElement("summary");
+      summary.textContent = `${skipped.length} 项不会互换（保留各自原内容）`;
+      note.appendChild(summary);
+      const list = document.createElement("div");
+      list.className = "hero-plan-rows";
+      skipped.forEach((text) => {
+        const row = document.createElement("div");
+        row.className = "hero-plan-row is-optional";
+        row.textContent = text;
+        list.appendChild(row);
+      });
+      note.appendChild(list);
+      report.appendChild(note);
+    }
+    $("#swap-export").disabled = !data.can_apply;
+    $("#swap-install").disabled = !data.can_apply;
+  }
+
+  async function inspectSwap() {
+    const heroId = $("#hero-id")?.value;
+    const a = $("#swap-a")?.value;
+    const b = $("#swap-b")?.value;
+    if (!heroId || !a || !b) { toast("请先选择角色和两个皮肤", true); return; }
+    if (a === b) { toast("请选择两个不同的皮肤", true); return; }
+    try {
+      const data = await call("inspect_skin_swap", { busy: true, busyText: "检查皮肤互换…" },
+        String(heroId), a, b, !!$("#swap-portraits")?.checked);
+      renderSwapReport(data);
+    } catch (err) {
+      $("#swap-report").innerHTML = "";
+      $("#swap-export").disabled = true;
+      $("#swap-install").disabled = true;
+      toast(err.message || "检查失败", true);
+    }
+  }
+
+  async function buildSwap(install) {
+    const heroId = $("#hero-id")?.value;
+    const a = $("#swap-a")?.value;
+    const b = $("#swap-b")?.value;
+    if (!heroId || !a || !b || a === b) { toast("请先选择两个不同的皮肤", true); return; }
+    const action = install ? "生成并安装" : "只生成 Mod";
+    if (install && !window.confirm("将生成互换 Mod 并立即安装。安装前请退出游戏，原资源包会自动备份。继续？")) return;
+    if (!install && !window.confirm("生成互换 Mod（不安装）？完成后可在 Mod 管理里选择该文件夹安装。")) return;
+    $("#swap-export").disabled = true;
+    $("#swap-install").disabled = true;
+    try {
+      const data = await call("apply_skin_swap", {
+        busy: true, busyText: install ? "生成并安装互换 Mod…约 3 分钟" : "生成互换 Mod…约 3 分钟",
+      }, String(heroId), a, b, !!$("#swap-portraits")?.checked, !!install);
+      const result = data.result || {};
+      const done = document.createElement("p");
+      done.className = "notice";
+      done.textContent = install
+        ? `已安装：${result.name}。退出游戏后重新进入查看效果；原包已备份。`
+        : `已生成：${result.pack}。到「Mod 管理」选择这个文件夹即可安装。`;
+      $("#swap-report").appendChild(done);
+      toast(install ? `已安装 ${result.name}` : `已生成 ${result.name}`);
+      if (install) {
+        try { const dash = await call("get_dashboard", { quiet: true }); if (dash) { state.dashboard = dash; } } catch (_) {}
+      }
+    } catch (err) {
+      toast(err.message || "互换失败", true);
+    } finally {
+      const enabled = state.heroSkins.length >= 2;
+      $("#swap-export").disabled = !enabled;
+      $("#swap-install").disabled = !enabled;
+    }
+  }
+
   function bindHeroPage() {
     $("#hero-scan")?.addEventListener("click", () => scanHeroes(false));
     $("#hero-scan-refresh")?.addEventListener("click", () => scanHeroes(true));
@@ -443,6 +570,15 @@
     $("#hero-plan")?.addEventListener("click", planHeroAssets);
     $("#hero-apply")?.addEventListener("click", applyHeroAssets);
     $("#hero-partial")?.addEventListener("change", resetHeroPlans);
+    $$('input[name="hero-mode"]').forEach((radio) =>
+      radio.addEventListener("change", () => { resetHeroPlans(); syncHeroMode(); }));
+    $("#swap-check")?.addEventListener("click", inspectSwap);
+    $("#swap-export")?.addEventListener("click", () => buildSwap(false));
+    $("#swap-install")?.addEventListener("click", () => buildSwap(true));
+    $("#swap-portraits")?.addEventListener("change", () => {
+      $("#swap-export").disabled = true;
+      $("#swap-install").disabled = true;
+    });
   }
 
   function renderDashboard() {
