@@ -130,6 +130,7 @@ def scan_controllers(
     一次扫描约 30 秒，会覆盖所有角色，之后按角色查询是即时的。
     """
     source_key = str(getattr(controller, "_index_source_key", ""))
+    cache = _cache_path()
     if not refresh:
         cached = _cached_controllers(controller)
         if cached:

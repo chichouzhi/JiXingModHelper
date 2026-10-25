@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -37,6 +38,7 @@ class HeroSkinChecks(unittest.TestCase):
             "bust0.bundle": self.root / "bust0.bundle",
             "bust1.bundle": self.root / "bust1.bundle",
             "other.bundle": self.root / "other.bundle",
+            "many.bundle": self.root / "many.bundle",
         }
         for path in self.bundles.values():
             path.write_bytes(b"base")
@@ -45,6 +47,7 @@ class HeroSkinChecks(unittest.TestCase):
             "anim": {
                 "ctrl.bundle": ["Idle", "Walk-Back"],
                 "ctrl01.bundle": ["Idle"],
+                "many.bundle": ["Idle", *[f"Action{index}" for index in range(10)]],
             },
             "texture": {
                 "bust0.bundle": ["UT_Hero_Bust_101_0", "UT_Hero_Bust_101_01_0"],
@@ -89,6 +92,19 @@ class HeroSkinChecks(unittest.TestCase):
                 continue
             Image.new("RGBA", (32, 32), (200, 30, 40, 255)).save(folder / "portraits" / f"{name}.png")
         return folder
+
+    def test_scan_controllers_writes_cache(self):
+        class ControllerObject:
+            type = SimpleNamespace(name="AnimatorController")
+
+            def peek_name(self):
+                return "Hero101_Controller"
+
+        with patch.object(hero_skins.UnityPy, "load", return_value=SimpleNamespace(objects=[ControllerObject()])):
+            found = hero_skins.scan_controllers(self.controller, refresh=True)
+        self.assertIn("Hero101_Controller", found)
+        self.assertTrue((self.root / "hero_controllers.json").is_file())
+        self.assertTrue(hero_skins.list_skins(self.controller, HERO))
 
     def test_parse_portrait_covers_skins_aliases_and_variants(self):
         self.assertEqual(hero_skins.parse_portrait("UT_Hero_Bust_101_0", HERO),
