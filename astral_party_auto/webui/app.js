@@ -549,9 +549,7 @@
         : `已生成：${result.pack}。到「Mod 管理」选择这个文件夹即可安装。`;
       $("#swap-report").appendChild(done);
       toast(install ? `已安装 ${result.name}` : `已生成 ${result.name}`);
-      if (install) {
-        try { const dash = await call("get_dashboard", { quiet: true }); if (dash) { state.dashboard = dash; } } catch (_) {}
-      }
+      if (install && data.dashboard) state.dashboard = data.dashboard;
     } catch (err) {
       toast(err.message || "互换失败", true);
     } finally {
