@@ -1556,3 +1556,33 @@ body.nav-open .sidebar {
   .topbar { flex-basis: 66px; }
   .browse-layout { min-height: calc(100vh - 102px); }
 }
+
+/* 整角色替换 */
+.hero-skin-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  cursor: pointer;
+}
+.hero-skin-row small { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+.hero-plan {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+}
+.hero-plan summary { cursor: pointer; color: var(--text); }
+.hero-plan-rows { display: grid; gap: 4px; margin-top: 8px; max-height: 300px; overflow: auto; }
+.hero-plan-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.hero-plan-row small { color: var(--muted); text-align: right; word-break: break-all; }
+.hero-plan-row.is-ok small { color: #7bd88f; }
+.hero-plan-row.is-missing small { color: #ff7b7b; }
+.hero-plan-row.is-optional { opacity: 0.65; }
+.check-row { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }

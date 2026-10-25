@@ -26,6 +26,7 @@
         <button class="nav-button" data-page="browse"><span class="nav-icon">⌕</span><span>浏览资源</span></button>
         <button class="nav-button" data-page="audio"><span class="nav-icon">♫</span><span>音频工作台</span><em id="nav-audio-count"></em></button>
         <button class="nav-button" data-page="studio"><span class="nav-icon">✦</span><span>制作替换</span></button>
+        <button class="nav-button" data-page="hero"><span class="nav-icon">◈</span><span>整角色替换</span></button>
         <button class="nav-button" data-page="pack"><span class="nav-icon">▣</span><span>我的作品集</span><em id="nav-pack-count"></em></button>
         <button class="nav-button" data-page="logs"><span class="nav-icon">≡</span><span>运行日志</span></button>
       </nav>
@@ -358,6 +359,40 @@
               <button id="commit-replacement" class="button primary">保存到作品集</button>
               <button class="button purple" data-page-link="pack">打开作品集 →</button>
             </div>
+          </div>
+        </section>
+
+        <section id="page-hero" class="page">
+          <article class="card">
+            <div><h2>整角色替换</h2><p>选一个角色，自动找出它在游戏里的全部皮肤；每个皮肤可一次替换核心立绘和全部局内小人动作。所有资源包都构建成功后才写入作品集。</p></div>
+            <div class="action-row">
+              <label>角色 <select id="hero-id"></select></label>
+              <button id="hero-scan" class="button ghost">扫描全部角色皮肤</button>
+              <button id="hero-scan-refresh" class="button ghost">重新扫描</button>
+              <span id="hero-scan-status" class="status-pill"><i></i><span>尚未扫描</span></span>
+            </div>
+          </article>
+          <div class="compare-grid">
+            <article class="card">
+              <h3>皮肤</h3>
+              <p id="hero-skins-hint" class="notice">先扫描，再勾选要替换的皮肤。</p>
+              <div id="hero-skins" class="draft-list"></div>
+            </article>
+            <article class="card">
+              <h3>素材与检查</h3>
+              <p class="notice">素材根目录下按 <code>角色ID/皮肤/portraits</code> 与 <code>角色ID/皮肤/actions</code> 放置；动作可用 GIF 或 PNG 帧目录，立绘用 PNG。可先生成模板再填文件。</p>
+              <div class="action-row">
+                <button id="hero-choose-assets" class="button ghost">选择素材根目录…</button>
+                <button id="hero-template" class="button ghost">生成素材模板…</button>
+              </div>
+              <p id="hero-assets-path" class="notice"></p>
+              <label class="check-row"><input id="hero-partial" type="checkbox"> 只替换已提供的项（缺失不报错）</label>
+              <div class="action-row">
+                <button id="hero-plan" class="button ghost">检查素材</button>
+                <button id="hero-apply" class="button primary" disabled>生成到作品集</button>
+              </div>
+              <div id="hero-report"></div>
+            </article>
           </div>
         </section>
 

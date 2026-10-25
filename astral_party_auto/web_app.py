@@ -108,6 +108,8 @@ class DesktopApi:
         self._draft_crop_token: str | None = None
         self._draft_crop_hash: str | None = None
         self._draft_crop_game_key = None
+        self._hero_assets_root: Path | None = None
+        self._hero_plans: list[dict] = []
         self._migration_source: Path | None = None
         self._migration_plans = []
         self._migration_warnings: list[str] = []
@@ -973,6 +975,79 @@ class DesktopApi:
     @exposed
     def get_character_labels(self) -> dict:
         return self.controller.character_labels()
+
+    @exposed
+    def get_hero_scan_summary(self) -> dict:
+        from .modkit.hero_skins import controller_summary
+
+        return controller_summary(self.controller)
+
+    @exposed
+    def scan_hero_controllers(self, refresh: bool = False) -> dict:
+        from .modkit.hero_skins import _hero_ids, scan_controllers
+
+        found = scan_controllers(self.controller, refresh=bool(refresh))
+        return {"scanned": True, "heroes": _hero_ids(found), "controllers": len(found)}
+
+    @exposed
+    def get_hero_skins(self, hero_id: str) -> dict:
+        from .modkit.hero_skins import list_skins
+
+        skins = list_skins(self.controller, str(hero_id))
+        return {
+            "hero": str(hero_id),
+            "skins": [
+                {"skin": skin.key, "label": skin.label, "controller": skin.controller,
+                 "bundle": skin.bundle, "actions": len(skin.actions)}
+                for skin in skins
+            ],
+        }
+
+    @exposed
+    def choose_hero_assets(self) -> dict | None:
+        path = self._pick_path("folder")
+        if path is None:
+            return None
+        self._hero_assets_root = Path(path)
+        self._hero_plans = []
+        return {"path": str(path)}
+
+    @exposed
+    def create_hero_template(self, hero_id: str, skins: list[str]) -> dict:
+        from .modkit.hero_skins import list_skins, write_template
+
+        if self._hero_assets_root is None:
+            raise RuntimeError("请先选择素材根目录。")
+        available = {skin.key: skin for skin in list_skins(self.controller, str(hero_id))}
+        selected = [available[key] for key in (skins or list(available)) if key in available]
+        if not selected:
+            raise RuntimeError("没有选中有效皮肤。")
+        return write_template(self._hero_assets_root, selected, self.controller)
+
+    @exposed
+    def inspect_hero_assets(self, hero_id: str, skins: list[str], partial: bool = False) -> dict:
+        from .modkit.hero_skins import plan_hero
+
+        if self._hero_assets_root is None:
+            raise RuntimeError("请先选择素材根目录。")
+        plans = plan_hero(
+            self.controller, str(hero_id), list(skins or []), self._hero_assets_root,
+            partial=bool(partial),
+        )
+        self._hero_plans = plans
+        return {"root": str(self._hero_assets_root), "plans": plans,
+                "can_apply": all(plan["can_apply"] for plan in plans)}
+
+    @exposed
+    def apply_hero_assets(self) -> dict:
+        from .modkit.hero_skins import apply_plans
+
+        plans = self._hero_plans
+        if not plans:
+            raise RuntimeError("请先检查素材。")
+        result = apply_plans(self.controller, plans)
+        self._hero_plans = []
+        return {"result": result, "draft": self._draft_state()}
 
     @exposed
     def set_resource_character(self, bundle: str, name: str, character: str) -> dict:

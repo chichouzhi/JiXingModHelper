@@ -13,6 +13,7 @@
     browse: "浏览资源",
     audio: "音频工作台",
     studio: "制作替换",
+    hero: "整角色替换",
     pack: "我的作品集",
     logs: "运行日志",
   };
@@ -62,6 +63,12 @@
     previewRequest: 0,
     animationPlayers: new Map(),
     draftIndex: -1,
+    heroHeroes: [],
+    heroSkins: [],
+    heroSelected: new Set(),
+    heroAssets: "",
+    heroPlans: [],
+    heroRequest: 0,
     pendingMod: null,
     migrationSource: null,
     replacement: null,
@@ -187,10 +194,255 @@
     if (page === "audio") window.AudioWorkbench?.enter();
     if (page === "workshop") window.ModWorkshop?.enter();
     if (page === "studio") refreshStudio();
+    if (page === "hero") loadHeroPage();
     if (page === "pack") refreshPack();
     if (page === "manage") renderInstalled();
     if (page === "logs") refreshLogs();
     if (page === "dashboard") renderDashboard();
+  }
+
+  function heroSelectedSkins() {
+    return state.heroSkins.filter((skin) => state.heroSelected.has(skin.skin)).map((skin) => skin.skin);
+  }
+
+  function resetHeroPlans() {
+    state.heroPlans = [];
+    const apply = $("#hero-apply");
+    if (apply) apply.disabled = true;
+    const report = $("#hero-report");
+    if (report) report.innerHTML = "";
+  }
+
+  function fillHeroSelect(heroes) {
+    const select = $("#hero-id");
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = "";
+    heroes.forEach((id) => {
+      const option = document.createElement("option");
+      option.value = id;
+      option.textContent = `角色 ${id}`;
+      select.appendChild(option);
+    });
+    if (current && heroes.includes(current)) select.value = current;
+  }
+
+  function renderHeroScan(summary) {
+    const status = $("#hero-scan-status");
+    if (status) {
+      const label = summary?.scanned
+        ? `已扫描 ${summary.controllers || 0} 个控制器 / ${summary.heroes?.length || 0} 个角色`
+        : "尚未扫描";
+      const span = status.lastElementChild || status;
+      span.textContent = label;
+      status.classList.toggle("is-ok", !!summary?.scanned);
+    }
+    if (summary?.heroes?.length) {
+      state.heroHeroes = summary.heroes;
+      fillHeroSelect(summary.heroes);
+    }
+  }
+
+  async function loadHeroPage() {
+    const path = $("#hero-assets-path");
+    if (path) path.textContent = state.heroAssets ? `素材根目录：${state.heroAssets}` : "尚未选择素材根目录。";
+    if (state.heroSkins.length) {
+      renderHeroSkins();
+      return;
+    }
+    try {
+      const summary = await call("get_hero_scan_summary", { quiet: true });
+      renderHeroScan(summary);
+      if (summary.scanned && summary.heroes?.length) {
+        await loadHeroSkins(summary.heroes[0]);
+      }
+    } catch (_) {}
+  }
+
+  async function scanHeroes(refresh = false) {
+    const button = refresh ? $("#hero-scan-refresh") : $("#hero-scan");
+    if (button) button.disabled = true;
+    try {
+      const data = await call("scan_hero_controllers", {
+        busy: true, busyText: "扫描角色皮肤…约 30 秒，只需一次",
+      }, refresh);
+      state.heroHeroes = data.heroes || [];
+      renderHeroScan({ ...data, scanned: true });
+      if (state.heroHeroes.length) await loadHeroSkins(state.heroHeroes[0]);
+      toast(`已找到 ${state.heroHeroes.length} 个角色`);
+    } catch (err) {
+      toast(err.message || "扫描失败", true);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function loadHeroSkins(heroId) {
+    const request = ++state.heroRequest;
+    const data = await call("get_hero_skins", { quiet: true }, String(heroId));
+    if (request !== state.heroRequest) return;
+    state.heroSkins = data.skins || [];
+    const existing = state.heroSelected;
+    state.heroSelected = new Set(state.heroSkins
+      .filter((skin) => existing.has(skin.skin))
+      .map((skin) => skin.skin));
+    if (!state.heroSelected.size) state.heroSkins.forEach((skin) => state.heroSelected.add(skin.skin));
+    resetHeroPlans();
+    renderHeroSkins();
+  }
+
+  function renderHeroSkins() {
+    const list = $("#hero-skins");
+    const hint = $("#hero-skins-hint");
+    if (!list) return;
+    list.innerHTML = "";
+    if (hint) hint.classList.toggle("is-hidden", state.heroSkins.length > 0);
+    state.heroSkins.forEach((skin) => {
+      const label = document.createElement("label");
+      label.className = "hero-skin-row";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.checked = state.heroSelected.has(skin.skin);
+      check.addEventListener("change", () => {
+        if (check.checked) state.heroSelected.add(skin.skin);
+        else state.heroSelected.delete(skin.skin);
+        resetHeroPlans();
+      });
+      const name = document.createElement("strong");
+      name.textContent = skin.label;
+      const detail = document.createElement("small");
+      detail.textContent = `${skin.actions} 个动作 · ${skin.controller}`;
+      label.append(check, name, detail);
+      list.appendChild(label);
+    });
+  }
+
+  async function chooseHeroAssets() {
+    try {
+      const data = await call("choose_hero_assets", { busy: true, busyText: "选择素材目录…" });
+      if (!data) return;
+      state.heroAssets = data.path;
+      const path = $("#hero-assets-path");
+      if (path) path.textContent = `素材根目录：${data.path}`;
+      resetHeroPlans();
+    } catch (err) {
+      toast(err.message || "选择目录失败", true);
+    }
+  }
+
+  async function createHeroTemplate() {
+    const heroId = $("#hero-id")?.value;
+    const skins = heroSelectedSkins();
+    if (!heroId || !skins.length) { toast("请先选择角色和皮肤", true); return; }
+    try {
+      const data = await call("create_hero_template", {
+        busy: true, busyText: "生成素材模板…",
+      }, String(heroId), skins);
+      toast(`模板已生成：${data.skins?.length || 0} 个皮肤目录`);
+      const path = $("#hero-assets-path");
+      if (path) path.textContent = `素材根目录：${data.root}`;
+    } catch (err) {
+      toast(err.message || "生成模板失败", true);
+    }
+  }
+
+  function heroAssetName(path) {
+    return String(path || "").split(/[\\/]/).pop();
+  }
+
+  function renderHeroPlans(data) {
+    const report = $("#hero-report");
+    if (!report) return;
+    report.innerHTML = "";
+    (data.plans || []).forEach((plan) => {
+      const details = document.createElement("details");
+      details.className = "hero-plan";
+      details.open = !plan.can_apply;
+      const summary = document.createElement("summary");
+      const stateText = plan.can_apply ? "可生成" : "素材不完整";
+      summary.textContent = `${plan.hero_id} / ${plan.label} · 已匹配 ${plan.matched} 项 · ${stateText}`;
+      details.appendChild(summary);
+      const table = document.createElement("div");
+      table.className = "hero-plan-rows";
+      [...plan.actions, ...plan.portraits].forEach((row) => {
+        const line = document.createElement("div");
+        line.className = `hero-plan-row${row.asset ? " is-ok" : row.required ? " is-missing" : " is-optional"}`;
+        const name = document.createElement("span");
+        name.textContent = `${row.kind === "action" ? "动作" : "立绘"} ${row.name}`;
+        const value = document.createElement("small");
+        if (row.asset) value.textContent = `✓ ${heroAssetName(row.asset)}`;
+        else if (row.error) value.textContent = `! ${row.error}`;
+        else value.textContent = row.required ? "缺失（必需）" : "缺失（可选）";
+        line.append(name, value);
+        table.appendChild(line);
+      });
+      details.appendChild(table);
+      report.appendChild(details);
+    });
+    const apply = $("#hero-apply");
+    if (apply) apply.disabled = !data.can_apply;
+    if (!data.can_apply) {
+      const warn = document.createElement("p");
+      warn.className = "notice";
+      warn.textContent = "存在必需素材缺失或重名；补齐后重新检查，或勾选「只替换已提供的项」。";
+      report.prepend(warn);
+    }
+  }
+
+  async function planHeroAssets() {
+    const heroId = $("#hero-id")?.value;
+    const skins = heroSelectedSkins();
+    if (!heroId || !skins.length) { toast("请先选择角色和皮肤", true); return; }
+    if (!state.heroAssets) { toast("请先选择素材根目录", true); return; }
+    try {
+      const data = await call("inspect_hero_assets", {
+        busy: true, busyText: "检查素材匹配…",
+      }, String(heroId), skins, !!$("#hero-partial")?.checked);
+      state.heroPlans = data.plans || [];
+      renderHeroPlans(data);
+      if (data.can_apply) toast("素材齐全，可以生成到作品集");
+    } catch (err) {
+      resetHeroPlans();
+      toast(err.message || "检查失败", true);
+    }
+  }
+
+  async function applyHeroAssets() {
+    if (!state.heroPlans.length) { toast("请先检查素材", true); return; }
+    if (!window.confirm("将把勾选皮肤的全部立绘和动作写入当前作品集。已有同项会被覆盖，是否继续？")) return;
+    const apply = $("#hero-apply");
+    if (apply) apply.disabled = true;
+    try {
+      const data = await call("apply_hero_assets", {
+        busy: true, busyText: "生成作品集…动作较多时需要几分钟",
+      });
+      if (data.draft) state.draft = data.draft;
+      if (typeof renderDraftList === "function") renderDraftList();
+      const count = data.result?.items?.length || 0;
+      toast(`已生成 ${count} 项，已写入作品集`);
+      resetHeroPlans();
+      const report = $("#hero-report");
+      if (report) {
+        const done = document.createElement("p");
+        done.className = "notice";
+        done.textContent = `已生成 ${count} 项。到「我的作品集」检查后安装或导出。`;
+        report.appendChild(done);
+      }
+    } catch (err) {
+      toast(err.message || "生成失败", true);
+      if (apply) apply.disabled = false;
+    }
+  }
+
+  function bindHeroPage() {
+    $("#hero-scan")?.addEventListener("click", () => scanHeroes(false));
+    $("#hero-scan-refresh")?.addEventListener("click", () => scanHeroes(true));
+    $("#hero-id")?.addEventListener("change", (event) => loadHeroSkins(event.target.value));
+    $("#hero-choose-assets")?.addEventListener("click", chooseHeroAssets);
+    $("#hero-template")?.addEventListener("click", createHeroTemplate);
+    $("#hero-plan")?.addEventListener("click", planHeroAssets);
+    $("#hero-apply")?.addEventListener("click", applyHeroAssets);
+    $("#hero-partial")?.addEventListener("change", resetHeroPlans);
   }
 
   function renderDashboard() {
@@ -1835,6 +2087,7 @@ ${row.bundle}`;
     $$("[data-page-link]").forEach((btn) =>
       btn.addEventListener("click", () => showPage(btn.dataset.pageLink))
     );
+    bindHeroPage();
 
     $("#mobile-nav-toggle")?.addEventListener("click", () => {
       document.body.classList.toggle("nav-open");
