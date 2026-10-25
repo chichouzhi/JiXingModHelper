@@ -6,12 +6,13 @@
 """
 from __future__ import annotations
 
+import re
 import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .animation import _load_bundle
+from .animation import _atomic_save, _load_bundle
 from .frame_atlas import (
     _texture_of,
     analyze_frames,
@@ -79,7 +80,55 @@ def _skin_by_key(controller, hero_id: str, key: str) -> SkinInfo:
     raise ValueError(f"角色 {hero_id} 没有皮肤 {key}；可用：{available}")
 
 
-def plan_swap(controller, hero_id: str, skin_a: str, skin_b: str, *, portraits: bool = True) -> dict:
+def _video_targets(controller, hero_id: str, skin_key: str) -> dict[bool, tuple[str, str]]:
+    """找出某个皮肤的 VSkill 技能演出视频（同一个皮肤可能有 sfw 版本）。"""
+    pattern = re.compile(
+        rf"^VSkill_Hero{re.escape(str(hero_id))}(?:_(01|02|Max))?(?:_sfw)?$"
+    )
+    found: dict[bool, tuple[str, str]] = {}
+    for bundle, names in (controller.typed_index.get("cri_usm") or {}).items():
+        for name in names:
+            match = pattern.match(name)
+            if not match:
+                continue
+            if (match.group(1) or "base") != skin_key:
+                continue
+            found[name.endswith("_sfw")] = (bundle, name)
+    return found
+
+
+def _video_data(bundle: Path, name: str) -> list[int]:
+    env = _load_bundle(bundle)
+    obj = next((item for item in env.objects
+                if item.type.name == "MonoBehaviour" and item.peek_name() == name), None)
+    if obj is None:
+        raise ValueError(f"找不到技能演出：{name}")
+    tree = obj.read_typetree()
+    refs = (tree.get("references") or {}).get("RefIds") or []
+    if not refs or not isinstance(refs[0].get("data"), dict):
+        raise ValueError(f"技能演出数据格式不支持：{name}")
+    data = refs[0]["data"].get("data")
+    if not data:
+        raise ValueError(f"技能演出数据为空：{name}")
+    return list(data)
+
+
+def _replace_video(bundle: Path, name: str, data: list[int], out: Path) -> None:
+    env = _load_bundle(bundle)
+    obj = next((item for item in env.objects
+                if item.type.name == "MonoBehaviour" and item.peek_name() == name), None)
+    if obj is None:
+        raise ValueError(f"找不到技能演出：{name}")
+    tree = obj.read_typetree()
+    tree["references"]["RefIds"][0]["data"]["data"] = data
+    obj.save_typetree(tree)
+    _atomic_save(env, out, lambda saved: None, packer="lzma")
+    if bytes(_video_data(out, name)) != bytes(data):
+        raise ValueError(f"技能演出写回校验失败：{name}")
+
+
+def plan_swap(controller, hero_id: str, skin_a: str, skin_b: str, *,
+              portraits: bool = True, videos: bool = True) -> dict:
     """返回两个皮肤可互换的动作/立绘，不写任何文件。"""
     a = _skin_by_key(controller, str(hero_id), str(skin_a))
     b = _skin_by_key(controller, str(hero_id), str(skin_b))
@@ -105,8 +154,24 @@ def plan_swap(controller, hero_id: str, skin_a: str, skin_b: str, *, portraits: 
             portrait_skipped.append({"name": targets_a[key].name, "reason": "仅皮肤 A 有"})
         for key in sorted(set(targets_b) - set(targets_a), key=lambda item: [str(part) for part in item]):
             portrait_skipped.append({"name": targets_b[key].name, "reason": "仅皮肤 B 有"})
-    if not actions and not portrait_pairs:
-        raise ValueError("两个皮肤没有可互换的公共动作或立绘。")
+    video_pairs = []
+    video_skipped = []
+    if videos:
+        targets_a = _video_targets(controller, a.hero_id, a.key)
+        targets_b = _video_targets(controller, b.hero_id, b.key)
+        for key in sorted(set(targets_a) & set(targets_b)):
+            bundle_a, name_a = targets_a[key]
+            bundle_b, name_b = targets_b[key]
+            video_pairs.append({
+                "key": [key], "name_a": name_a, "name_b": name_b,
+                "bundle_a": bundle_a, "bundle_b": bundle_b,
+            })
+        for key in sorted(set(targets_a) - set(targets_b)):
+            video_skipped.append({"name": targets_a[key][1], "reason": "仅皮肤 A 有"})
+        for key in sorted(set(targets_b) - set(targets_a)):
+            video_skipped.append({"name": targets_b[key][1], "reason": "仅皮肤 B 有"})
+    if not actions and not portrait_pairs and not video_pairs:
+        raise ValueError("两个皮肤没有可互换的公共动作、立绘或技能演出。")
     return {
         "hero_id": a.hero_id,
         "skin_a": {"key": a.key, "label": a.label, "bundle": a.bundle, "actions": len(a.actions)},
@@ -116,7 +181,9 @@ def plan_swap(controller, hero_id: str, skin_a: str, skin_b: str, *, portraits: 
         "only_b": only_b,
         "portraits": portrait_pairs,
         "portrait_skipped": portrait_skipped,
-        "can_apply": bool(actions or portrait_pairs),
+        "videos": video_pairs,
+        "video_skipped": video_skipped,
+        "can_apply": bool(actions or portrait_pairs or video_pairs),
     }
 
 
@@ -127,10 +194,11 @@ def swap_skins(
     skin_b: str,
     *,
     portraits: bool = True,
+    videos: bool = True,
     install: bool = False,
 ) -> dict:
     """构建双向互换 Mod；全部成功后才写入 made_mods 并（可选）安装。"""
-    plan = plan_swap(controller, hero_id, skin_a, skin_b, portraits=portraits)
+    plan = plan_swap(controller, hero_id, skin_a, skin_b, portraits=portraits, videos=videos)
     a = _skin_by_key(controller, str(hero_id), str(skin_a))
     b = _skin_by_key(controller, str(hero_id), str(skin_b))
     source_a = _original(controller, a.bundle)
@@ -155,15 +223,32 @@ def swap_skins(
             result_a = replace_animation_frames_batch(
                 source_a, {action: frames[("b", action)] for action in common},
                 out_a, packer="lzma", inline_stream=True, unbounded_source=True,
+                direct=True,
             )
             result_b = replace_animation_frames_batch(
                 source_b, {action: frames[("a", action)] for action in common},
                 out_b, packer="lzma", inline_stream=True, unbounded_source=True,
+                direct=True,
             )
             outputs[a.bundle] = out_a
             outputs[b.bundle] = out_b
         else:
             result_a = result_b = {"frame_counts": {}}
+
+        replaced_videos = 0
+        for pair in plan.get("videos", []):
+            bundle_a, bundle_b = pair["bundle_a"], pair["bundle_b"]
+            if bundle_a == bundle_b:
+                continue
+            data_a = _video_data(_original(controller, bundle_a), pair["name_a"])
+            data_b = _video_data(_original(controller, bundle_b), pair["name_b"])
+            out_video_a = stage / bundle_a
+            out_video_b = stage / bundle_b
+            _replace_video(_original(controller, bundle_a), pair["name_a"], data_b, out_video_a)
+            _replace_video(_original(controller, bundle_b), pair["name_b"], data_a, out_video_b)
+            outputs[bundle_a] = out_video_a
+            outputs[bundle_b] = out_video_b
+            replaced_videos += 1
 
         replaced_portraits = 0
         if plan["portraits"]:
@@ -211,6 +296,7 @@ def swap_skins(
                 f"动作：{len(common)} 个公共动作双向互换；"
                 f"仅 A 有 {len(plan['only_a'])} 个、仅 B 有 {len(plan['only_b'])} 个保持原样。",
                 f"立绘：{replaced_portraits} 个贴图双向互换。",
+                f"技能演出：{replaced_videos} 对 USM 双向互换。",
                 "安装前退出游戏；安装时管理器会备份原资源包，卸载或一键还原可恢复。",
                 "仅替换外观，不改变动作列表、控制器、音效和角色拥有状态。",
             ]) + "\n",
@@ -226,9 +312,11 @@ def swap_skins(
             "installed": installed,
             "actions": len(common),
             "portraits": replaced_portraits,
+            "videos": replaced_videos,
             "only_a": plan["only_a"],
             "only_b": plan["only_b"],
             "portrait_skipped": plan["portrait_skipped"],
+            "video_skipped": plan.get("video_skipped", []),
             "frame_counts": {"a": result_a.get("frame_counts", {}), "b": result_b.get("frame_counts", {})},
         }
     finally:

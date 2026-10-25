@@ -906,6 +906,7 @@ def replace_animation_frames_batch(
     packer: str = "original",
     inline_stream: bool = False,
     unbounded_source: bool = False,
+    direct: bool = False,
 ) -> dict:
     """一次写回同一个资源包里的多个动作，最后统一压缩和回读校验。
 
@@ -936,7 +937,7 @@ def replace_animation_frames_batch(
         source_durations[anim_name] = sum(durations)
         try:
             if tile:
-                if max(len(frame.quads) for frame in frames) > 64:
+                if direct or max(len(frame.quads) for frame in frames) > 64:
                     atlas = compose_grid(frames, images, size)
                 else:
                     original = data.image.convert("RGBA") if data.image is not None else None
