@@ -322,14 +322,14 @@ def _set_text_bytes(data, raw: bytes) -> None:
     data.save()
 
 
-def _atomic_save(env, out_bundle: str | Path, validate) -> None:
+def _atomic_save(env, out_bundle: str | Path, validate, packer: str = "original") -> None:
     out = Path(out_bundle)
     out.parent.mkdir(parents=True, exist_ok=True)
     # 沿用原包的压缩方式（LZ4/LZMA）；默认不压缩会让 24MB 的包涨到 90MB 以上。
     from UnityPy.files import BundleFile, SerializedFile
 
     if isinstance(env.file, (BundleFile, SerializedFile)):
-        payload = env.file.save(packer="original")
+        payload = env.file.save(packer=packer)
     else:
         payload = env.file.save()
     # Verify the serialized bundle, not just the in-memory edited objects.

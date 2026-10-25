@@ -14,11 +14,16 @@
 """
 from __future__ import annotations
 
+import copy
 import json
+import math
+import re
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
+from UnityPy.classes import Rectf, StreamingInfo, SubMesh
 from UnityPy.helpers.MeshHelper import MeshHandler
 
 from .animation import (
@@ -35,7 +40,7 @@ from .animation import (
 PPU_DEFAULT = 100.0
 # 原始图集里不透明度低于该比例的瓦片，视为打包器复用的透明占位格。
 BLANK_ALPHA_RATIO = 0.01
-MAX_TILES = 8192
+MAX_TILES = 200_000
 FRAME_NOTICE = "按图集瓦片的本地位置逐帧写回；游戏内播放速度和顺序不变。"
 
 
@@ -55,6 +60,17 @@ class Frame:
     index: int
     bbox: tuple[float, float, float, float]
     quads: tuple[Quad, ...]
+
+
+@dataclass(frozen=True)
+class MeshFrame:
+    """紧贴网格帧：没有四边形瓦片，替换时需要重排图集。"""
+
+    name: str
+    index: int
+    bbox: tuple[float, float, float, float]
+    sprite: object
+    render_data: object
 
 
 def _frame_index(name: str) -> int:
@@ -176,10 +192,15 @@ def find_frame_texture(env, asset_name: str) -> str:
                       if texture_name.casefold().startswith(lowered + "-")}
     if not candidates:
         raise ValueError(f"{name}: 没有找到可逐帧替换的图集，此动画可能引用外部图集或骨骼网格")
+    # 优先选「动作名-数字」的图集，排除 Fight-move-effect-001 这类同前缀特效图。
+    preferred = {texture for texture in candidates
+                 if re.fullmatch(re.escape(name) + r"-\d+", texture, re.IGNORECASE)}
+    if preferred:
+        candidates = preferred
     usable = []
     for texture_name in sorted(candidates):
         try:
-            if read_frames(env, texture_name):
+            if analyze_frames(env, texture_name)[0]:
                 usable.append(texture_name)
         except ValueError:
             continue
@@ -371,6 +392,243 @@ def _fit_without_collision(source: Image.Image, safe: tuple[int, int, int, int],
         fitted.close()
         scale -= 0.04
     return None
+
+
+def _inline_all_textures(env) -> int:
+    """把仍在 .resS 里的贴图改为内嵌，便于整包重压缩并删除 resS。"""
+    count = 0
+    for obj in env.objects:
+        if obj.type.name != "Texture2D":
+            continue
+        data = obj.read()
+        stream = getattr(data, "m_StreamData", None)
+        if not stream or int(getattr(stream, "size", 0) or 0) <= 0:
+            continue
+        raw = data.get_image_data()
+        data.image_data = raw
+        data.m_CompleteImageSize = len(raw)
+        data.m_StreamData = StreamingInfo(offset=0, size=0, path="")
+        data.save()
+        count += 1
+    return count
+
+
+def _drop_unused_stream(env, *, force: bool = False) -> list[str]:
+    """全部贴图都改为内嵌像素后，删除不再被引用的 .resS，避免体积翻倍。"""
+    files = getattr(getattr(env, "file", None), "files", None)
+    if not isinstance(files, dict):
+        return []
+    used: set[str] = set()
+    if not force:
+        for obj in env.objects:
+            if obj.type.name != "Texture2D":
+                continue
+            stream = getattr(obj.read(), "m_StreamData", None)
+            path = str(getattr(stream, "path", "") or "")
+            if path and int(getattr(stream, "size", 0) or 0) > 0:
+                used.add(Path(path).name)
+    removed = []
+    for name in list(files):
+        if not isinstance(name, str):
+            continue
+        if name.lower().endswith(".ress") and (force or Path(name).name not in used):
+            del files[name]
+            removed.append(name)
+    return removed
+
+
+def _tile_mesh(vertices, uvs) -> bool:
+    if not vertices or len(vertices) % 4 or len(vertices) != len(uvs):
+        return False
+    for start in range(0, len(vertices), 4):
+        us = {round(uvs[start + index][0], 6) for index in range(4)}
+        vs = {round(uvs[start + index][1], 6) for index in range(4)}
+        if len(us) != 2 or len(vs) != 2:
+            return False
+        pairs = {(round(uvs[start + index][0], 6), round(uvs[start + index][1], 6))
+                 for index in range(4)}
+        if len(pairs) != 4:
+            return False
+    return True
+
+
+def analyze_frames(env, texture_name: str):
+    """读取帧；返回 (frames, True) 表示四边形瓦片，False 表示紧贴网格。"""
+    frames: list[Frame] = []
+    meshes: list[MeshFrame] = []
+    tiles = 0
+    for obj in env.objects:
+        if obj.type.name != "Sprite":
+            continue
+        sprite = obj.read()
+        if getattr(sprite, "m_SpriteAtlas", None) and getattr(sprite.m_SpriteAtlas, "m_PathID", 0):
+            raise ValueError(f"{sprite.m_Name}: 使用独立 SpriteAtlas，暂不支持逐帧替换")
+        data = sprite.m_RD
+        pointer = data.texture
+        reader = pointer.deref() if pointer is not None else None
+        if reader is None or reader.read().m_Name != texture_name:
+            continue
+        mesh = MeshHandler(data, obj.version)
+        mesh.process()
+        vertices = mesh.m_Vertices or []
+        uvs = mesh.m_UV0 or []
+        if not vertices or len(vertices) != len(uvs):
+            raise ValueError(f"{sprite.m_Name}: 网格数据缺失，无法读取瓦片")
+        ppu = float(getattr(sprite, "m_PixelsToUnits", 0) or PPU_DEFAULT)
+        xs = [vertex[0] * ppu for vertex in vertices]
+        ys = [vertex[1] * ppu for vertex in vertices]
+        bbox = (min(xs), min(ys), max(xs), max(ys))
+        index = _frame_index(str(sprite.m_Name))
+        if _tile_mesh(vertices, uvs):
+            tiles += max(1, len(vertices) // 4)
+            if tiles > MAX_TILES:
+                raise ValueError(f"图集瓦片过多（>{MAX_TILES}），暂不生成预览")
+            quads: list[Quad] = []
+            for start in range(0, len(vertices), 4):
+                qx = [vertices[start + i][0] * ppu for i in range(4)]
+                qy = [vertices[start + i][1] * ppu for i in range(4)]
+                qu = [uvs[start + i][0] for i in range(4)]
+                qv = [uvs[start + i][1] for i in range(4)]
+                quads.append(Quad((min(qx), min(qy), max(qx), max(qy)),
+                                  (min(qu), min(qv), max(qu), max(qv))))
+            frames.append(Frame(str(sprite.m_Name), index, bbox, tuple(quads)))
+        meshes.append(MeshFrame(str(sprite.m_Name), index, bbox, sprite, data))
+    if not meshes:
+        raise ValueError(f"{texture_name}: 没有找到帧 Sprite")
+    meshes.sort(key=lambda frame: frame.index)
+    if len(frames) == len(meshes):
+        frames.sort(key=lambda frame: frame.index)
+        return frames, True
+    return meshes, False
+
+
+def _set_quad(sprite, render_data, local: tuple[float, float, float, float],
+              uv: tuple[float, float, float, float]) -> None:
+    x0, y0, x1, y1 = local
+    u0, v0, u1, v1 = uv
+    vertices = [(x0, y0, 0.0), (x1, y0, 0.0), (x1, y1, 0.0), (x0, y1, 0.0)]
+    uvs = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    data = b"".join(struct.pack("<3f", *vertex) for vertex in vertices)
+    data += b"".join(struct.pack("<2f", *uv_value) for uv_value in uvs)
+    if not render_data.m_SubMeshes:
+        raise ValueError(f"{sprite.m_Name}: 没有子网格，暂不支持重排")
+    sub = copy.deepcopy(render_data.m_SubMeshes[0])
+    sub.indexCount = 12
+    sub.vertexCount = 4
+    sub.firstByte = 0
+    sub.firstVertex = 0
+    sub.baseVertex = 0
+    render_data.m_SubMeshes = [sub]
+    render_data.m_IndexBuffer = [0, 0, 1, 0, 2, 0, 2, 0, 3, 0, 0, 0]
+    render_data.m_VertexData.m_VertexCount = 4
+    render_data.m_VertexData.m_DataSize = data
+    rect = Rectf(x=x0, y=y0, width=x1 - x0, height=y1 - y0)
+    render_data.textureRect = rect
+    sprite.m_Rect = rect
+    sprite.save()
+
+
+def _pack_entries(entries: list[dict], width: int, height: int) -> float:
+    total = sum(max(1, entry["content"].width) * max(1, entry["content"].height)
+                for entry in entries)
+    capacity = width * height * 0.9
+    scale = min(1.0, math.sqrt(capacity / total)) if total > capacity else 1.0
+    if scale < 1.0:
+        for entry in entries:
+            content = entry["content"]
+            new_size = (max(1, round(content.width * scale)), max(1, round(content.height * scale)))
+            entry["content"] = content.resize(new_size, Image.LANCZOS)
+            x0, y0, x1, y1 = entry["local"]
+            center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+            entry["local"] = (center_x - new_size[0] / 2, center_y - new_size[1] / 2,
+                              center_x + new_size[0] / 2, center_y + new_size[1] / 2)
+    padding = 1
+    order = sorted(range(len(entries)), key=lambda index: entries[index]["content"].height, reverse=True)
+    cursor_x = cursor_y = row_height = 0
+    for index in order:
+        entry = entries[index]
+        tile_width, tile_height = entry["content"].size
+        if cursor_x + tile_width > width:
+            cursor_x = 0
+            cursor_y += row_height + padding
+            row_height = 0
+        if cursor_y + tile_height > height:
+            raise ValueError(
+                f"图集 {width}×{height} 放不下 {len(entries)} 帧，请减少帧数或缩小素材"
+            )
+        entry["packed"] = (cursor_x, cursor_y)
+        cursor_x += tile_width + padding
+        row_height = max(row_height, tile_height)
+    return scale
+
+
+def _rebake_mesh_frames(env, texture_name: str, frames: list[MeshFrame],
+                        images: list[Image.Image], size: tuple[int, int]) -> float:
+    width, height = size
+    entries = []
+    for index, frame in enumerate(frames):
+        source = images[_pick_index(len(images), index, len(frames))].convert("RGBA")
+        x0, y0, x1, y1 = frame.bbox
+        frame_width = max(1, round(x1 - x0))
+        frame_height = max(1, round(y1 - y0))
+        source = source.resize((frame_width, frame_height), Image.LANCZOS)
+        bounds = source.getchannel("A").getbbox()
+        if bounds is None:
+            content = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+            local = (center_x - 0.5, center_y - 0.5, center_x + 0.5, center_y + 0.5)
+        else:
+            left, top, right, bottom = bounds
+            content = source.crop(bounds)
+            local = (x0 + left, y1 - bottom, x0 + right, y1 - top)
+        entries.append({"frame": frame, "content": content, "local": local})
+    scale = _pack_entries(entries, width, height)
+    atlas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    for entry in entries:
+        tile_width, tile_height = entry["content"].size
+        pack_x, pack_y = entry["packed"]
+        entry["uv"] = (pack_x / width, 1 - (pack_y + tile_height) / height,
+                       (pack_x + tile_width) / width, 1 - pack_y / height)
+        atlas.alpha_composite(entry["content"], (pack_x, pack_y))
+    for entry in entries:
+        _set_quad(entry["frame"].sprite, entry["frame"].render_data, entry["local"], entry["uv"])
+    _set_image(_texture_of(env, texture_name).read(), atlas)
+    atlas.close()
+    return scale
+
+
+def compose_grid(
+    frames: list[Frame],
+    images: list[Image.Image],
+    size: tuple[int, int],
+) -> Image.Image:
+    """高密度网格帧（皮肤小人常见）：按每个小四边形原样搬运，不做占位格推断。"""
+    if not images:
+        raise ValueError("没有可用的替换帧")
+    width, height = size
+    _size_limit(width, height)
+    atlas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    written: set[tuple[int, int, int, int]] = set()
+    for index, frame in enumerate(frames):
+        source = images[_pick_index(len(images), index, len(frames))].convert("RGBA")
+        x0, y0, x1, y1 = frame.bbox
+        source = source.resize((max(1, round(x1 - x0)), max(1, round(y1 - y0))), Image.LANCZOS)
+        for (left, top, right, bottom), (u0, v0, u1, v1) in _tile_rects(frame):
+            ax0, ax1 = round(u0 * width), round(u1 * width)
+            ay0, ay1 = round((1 - v1) * height), round((1 - v0) * height)
+            if ax1 <= ax0 or ay1 <= ay0:
+                continue
+            key = (ax0, ay0, ax1, ay1)
+            if key in written:
+                continue
+            written.add(key)
+            tile = source.crop((left, top, right, bottom))
+            target = (ax1 - ax0, ay1 - ay0)
+            if tile.size != target:
+                tile = tile.resize(target, Image.LANCZOS)
+            atlas.alpha_composite(tile, (ax0, ay0))
+        source.close()
+    return atlas
 
 
 def compose(
@@ -593,30 +851,99 @@ def replace_animation_frames(
     fps: float = 30,
 ) -> dict:
     """按动画名找到帧图集，用 GIF/APNG/WebP 或 PNG 帧目录逐帧写回。"""
-    env = _load_bundle(src_bundle)
-    texture_name = find_frame_texture(env, anim_name)
-    frames = read_frames(env, texture_name)
-    data = _texture_of(env, texture_name).read()
-    size = (int(data.m_Width), int(data.m_Height))
-    original = data.image.convert("RGBA") if data.image is not None else None
-    images, durations, _ = _read_replacement(replacement_path, fps)
-    try:
-        atlas = compose(frames, images, size, original)
-    finally:
-        for image in images:
-            image.close()
-        if original is not None:
-            original.close()
-    _set_image(data, atlas)
-    atlas.close()
-    _atomic_save(env, out_bundle, lambda saved: _validate(saved, texture_name, len(frames), size))
+    result = replace_animation_frames_batch(
+        src_bundle, {anim_name: replacement_path}, out_bundle, fps
+    )
+    texture_name = result["textures"][anim_name]
     return {
         "texture": texture_name,
-        "frames": len(frames),
-        "atlas": size,
-        "images": len(images),
-        "source_frames": len(images),
-        "source_duration": sum(durations),
+        "frames": result["frame_counts"][anim_name],
+        "atlas": result["atlas_sizes"][texture_name],
+        "images": result["source_counts"][anim_name],
+        "source_frames": result["source_counts"][anim_name],
+        "source_duration": result["source_durations"][anim_name],
+        "mesh_rebaked": result["mesh_rebaked"],
+        "frame_atlas": True,
+    }
+
+
+@_release_readers
+def replace_animation_frames_batch(
+    src_bundle: str | Path,
+    replacements: dict[str, str | Path],
+    out_bundle: str | Path,
+    fps: float = 30,
+    packer: str = "original",
+    inline_stream: bool = False,
+) -> dict:
+    """一次写回同一个资源包里的多个动作，最后统一压缩和回读校验。
+
+    同一角色的全部动作共用一个 controller 资源包，逐个动作保存会反复读写
+    几十 MB；这里只加载一次、逐个动作合成，最后原子写一次。
+    紧贴网格（非四边形瓦片）的皮肤会自动重排成四边形并重新打包图集。
+    """
+    if not replacements:
+        raise ValueError("没有要替换的动作")
+    env = _load_bundle(src_bundle)
+    textures: dict[str, str] = {}
+    frame_counts: dict[str, int] = {}
+    atlas_sizes: dict[str, tuple[int, int]] = {}
+    source_counts: dict[str, int] = {}
+    source_durations: dict[str, int] = {}
+    expected: dict[str, tuple[int, tuple[int, int]]] = {}
+    scales: dict[str, float] = {}
+    for anim_name, replacement_path in replacements.items():
+        texture_name = find_frame_texture(env, anim_name)
+        frames, tile = analyze_frames(env, texture_name)
+        data = _texture_of(env, texture_name).read()
+        size = (int(data.m_Width), int(data.m_Height))
+        images, durations, _ = _read_replacement(replacement_path, fps)
+        source_counts[anim_name] = len(images)
+        source_durations[anim_name] = sum(durations)
+        try:
+            if tile:
+                if max(len(frame.quads) for frame in frames) > 64:
+                    atlas = compose_grid(frames, images, size)
+                else:
+                    original = data.image.convert("RGBA") if data.image is not None else None
+                    try:
+                        atlas = compose(frames, images, size, original)
+                    finally:
+                        if original is not None:
+                            original.close()
+                _set_image(data, atlas)
+                atlas.close()
+            else:
+                scales[anim_name] = _rebake_mesh_frames(env, texture_name, frames, images, size)
+        finally:
+            for image in images:
+                image.close()
+        textures[anim_name] = texture_name
+        frame_counts[anim_name] = len(frames)
+        atlas_sizes[texture_name] = size
+        expected[texture_name] = (len(frames), size)
+
+    def validate(saved) -> None:
+        for texture_name, (frame_count, size) in expected.items():
+            _validate(saved, texture_name, frame_count, size)
+
+    removed = _drop_unused_stream(env)
+    inlined = _inline_all_textures(env) if inline_stream else 0
+    if inline_stream and inlined:
+        removed += _drop_unused_stream(env, force=True)
+    _atomic_save(env, out_bundle, validate, packer=packer)
+    return {
+        "actions": len(replacements),
+        "textures": textures,
+        "frame_counts": frame_counts,
+        "atlas_sizes": atlas_sizes,
+        "source_counts": source_counts,
+        "source_durations": source_durations,
+        "frames": sum(count for count, _ in expected.values()),
+        "mesh_rebaked": sorted(scales),
+        "stream_inlined": inlined,
+        "stream_removed": removed,
+        "packer": packer,
         "frame_atlas": True,
     }
 
