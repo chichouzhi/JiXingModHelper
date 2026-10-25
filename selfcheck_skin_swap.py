@@ -27,6 +27,8 @@ class SkinSwapChecks(unittest.TestCase):
             "ctrl_b.bundle": self.root / "ctrl_b.bundle",
             "bust_a.bundle": self.root / "bust_a.bundle",
             "bust_b.bundle": self.root / "bust_b.bundle",
+            "video_a.bundle": self.root / "video_a.bundle",
+            "video_b.bundle": self.root / "video_b.bundle",
         }
         for path in self.bundles.values():
             path.write_bytes(b"base")
@@ -47,6 +49,10 @@ class SkinSwapChecks(unittest.TestCase):
                 "bust_a.bundle": ["UT_Hero_Bust_101_0", "UT_Hero_Bust_101_1"],
                 "bust_b.bundle": ["UT_Hero_Bust_101_01_0", "UT_Hero_Bust_101_01_1"],
             },
+            "cri_usm": {
+                "video_a.bundle": ["VSkill_Hero101"],
+                "video_b.bundle": ["VSkill_Hero101_01"],
+            },
         }
         self.controller._index_source_key = "selfcheck"
         self.controller.aa_dirs = (self.root / "cache", self.root / "base")
@@ -66,6 +72,7 @@ class SkinSwapChecks(unittest.TestCase):
         self.assertEqual(plan["actions"], ["Idle", "Walk-Back"])
         self.assertEqual(plan["only_b"], ["Extra"])
         self.assertEqual(len(plan["portraits"]), 2)
+        self.assertEqual(len(plan["videos"]), 1)
         self.assertTrue(plan["can_apply"])
 
     def test_same_skin_is_rejected(self):
@@ -91,19 +98,30 @@ class SkinSwapChecks(unittest.TestCase):
             Path(target).write_bytes(b"portrait")
             return {name: (8, 8) for name in replacements}
 
+        def fake_video(bundle, name):
+            return [1, 2, 3]
+
+        def fake_replace_video(bundle, name, data, target):
+            Path(target).write_bytes(b"video")
+
         with patch.object(skin_swap, "_render_frames", side_effect=fake_render), \
                 patch.object(skin_swap, "replace_animation_frames_batch", side_effect=fake_batch), \
                 patch.object(skin_swap, "_extract_portrait", side_effect=fake_extract), \
-                patch.object(skin_swap, "_replace_textures_batch", side_effect=fake_portraits):
+                patch.object(skin_swap, "_replace_textures_batch", side_effect=fake_portraits), \
+                patch.object(skin_swap, "_video_data", side_effect=fake_video), \
+                patch.object(skin_swap, "_replace_video", side_effect=fake_replace_video):
             result = skin_swap.swap_skins(self.controller, HERO, "base", "01", install=True)
         self.assertTrue(result["installed"])
         self.assertEqual(result["actions"], 2)
         self.assertEqual(result["portraits"], 4)
+        self.assertEqual(result["videos"], 1)
         pack = Path(result["pack"])
         self.assertTrue((pack / "ctrl_a.bundle").is_file())
         self.assertTrue((pack / "ctrl_b.bundle").is_file())
         self.assertTrue((pack / "bust_a.bundle").is_file())
         self.assertTrue((pack / "bust_b.bundle").is_file())
+        self.assertTrue((pack / "video_a.bundle").is_file())
+        self.assertTrue((pack / "video_b.bundle").is_file())
         self.assertTrue((pack / "README.txt").is_file())
         self.controller.install.assert_called_once()
 
