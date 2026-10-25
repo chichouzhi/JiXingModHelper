@@ -61,6 +61,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python selfcheck_hero_skins.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python selfcheck_skin_swap.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check frontend syntax
         shell: pwsh

@@ -386,6 +386,26 @@ class FrameAtlasChecks(unittest.TestCase):
             replace_clip_atlas_checked(self.bundle, ANIM_NAME, small, out)
         self.assertFalse(out.exists())
 
+    def test_inline_stream_skips_textures_already_replaced(self):
+        from types import SimpleNamespace
+
+        replaced = SimpleNamespace(
+            m_Name="Idle-001", m_StreamData=SimpleNamespace(size=99),
+            image_data=b"new", m_CompleteImageSize=3, save=lambda: None,
+        )
+        other = SimpleNamespace(
+            m_Name="Hit-001", m_StreamData=SimpleNamespace(size=99),
+            image_data=b"", m_CompleteImageSize=0, save=lambda: None,
+            get_image_data=lambda: b"old",
+        )
+        env = SimpleNamespace(
+            objects=[SimpleNamespace(type=SimpleNamespace(name="Texture2D"), read=lambda: replaced),
+                     SimpleNamespace(type=SimpleNamespace(name="Texture2D"), read=lambda: other)],
+        )
+        count = frame_atlas._inline_all_textures(env, exclude={"Idle-001"})
+        self.assertEqual(count, 1)
+        self.assertEqual(replaced.image_data, b"new")
+
     def test_compose_grid_writes_dense_mesh_quads(self):
         quads = tuple(
             frame_atlas.Quad(
