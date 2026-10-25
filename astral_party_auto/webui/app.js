@@ -481,12 +481,13 @@
     report.innerHTML = "";
     const head = document.createElement("p");
     head.className = "notice";
-    head.textContent = `${data.skin_a.label} ↔ ${data.skin_b.label}：公共动作 ${data.actions.length} 个，立绘 ${data.portraits.length} 对`;
+    head.textContent = `${data.skin_a.label} ↔ ${data.skin_b.label}：公共动作 ${data.actions.length} 个，立绘 ${data.portraits.length} 对，技能演出 ${(data.videos || []).length} 对`;
     report.appendChild(head);
     const skipped = [
       ...data.only_a.map((name) => `仅 A 有动作 ${name}`),
       ...data.only_b.map((name) => `仅 B 有动作 ${name}`),
       ...(data.portrait_skipped || []).map((row) => `${row.name}：${row.reason}`),
+      ...(data.video_skipped || []).map((row) => `${row.name}：${row.reason}`),
     ];
     if (skipped.length) {
       const note = document.createElement("details");
@@ -517,7 +518,7 @@
     if (a === b) { toast("请选择两个不同的皮肤", true); return; }
     try {
       const data = await call("inspect_skin_swap", { busy: true, busyText: "检查皮肤互换…" },
-        String(heroId), a, b, !!$("#swap-portraits")?.checked);
+        String(heroId), a, b, !!$("#swap-portraits")?.checked, !!$("#swap-videos")?.checked);
       renderSwapReport(data);
     } catch (err) {
       $("#swap-report").innerHTML = "";
@@ -540,7 +541,7 @@
     try {
       const data = await call("apply_skin_swap", {
         busy: true, busyText: install ? "生成并安装互换 Mod…约 3 分钟" : "生成互换 Mod…约 3 分钟",
-      }, String(heroId), a, b, !!$("#swap-portraits")?.checked, !!install);
+      }, String(heroId), a, b, !!$("#swap-portraits")?.checked, !!$("#swap-videos")?.checked, !!install);
       const result = data.result || {};
       const done = document.createElement("p");
       done.className = "notice";
@@ -574,6 +575,10 @@
     $("#swap-export")?.addEventListener("click", () => buildSwap(false));
     $("#swap-install")?.addEventListener("click", () => buildSwap(true));
     $("#swap-portraits")?.addEventListener("change", () => {
+      $("#swap-export").disabled = true;
+      $("#swap-install").disabled = true;
+    });
+    $("#swap-videos")?.addEventListener("change", () => {
       $("#swap-export").disabled = true;
       $("#swap-install").disabled = true;
     });
