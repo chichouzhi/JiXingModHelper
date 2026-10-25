@@ -69,6 +69,14 @@ python -m astral_party_auto.modkit.frame_atlas --bundle "Hero101_Controller.bund
 
 **体积与压缩。** 整角色批量会改用 LZMA 压缩、把仍在 `.resS` 里的贴图改为内嵌并删除不再需要的 `.resS`，避免「新图内嵌 + 旧流式数据」体积翻倍。实测 101：基础皮肤整套约 16 MB，`01` 皮肤整套约 28 MB（含 8 张立绘、24 个动作），单个 controller 资源包低于 40 MB。四个皮肤合计约 80 MB，本地安装正常；工坊投稿仍受 80 MiB 上限约束。
 
+**两个皮肤互换（只换外观）。** 同一页面顶部切到「两个皮肤互换」，选择皮肤 A 和皮肤 B，点「检查互换」：
+
+- 两个皮肤**都有的动作**会双向互换小人帧：A 用 B 的帧，B 用 A 的；各自动作数量、帧数、控制器和音效不变，只换可见像素。
+- 只有一方有的动作（例如 `01` 多出的特效动作）保持原样，不互换。
+- 勾选「同时互换立绘」会按类别/层/变体配对核心立绘并双向交换；只有一方有的 sfw 或好感头像保持原样。
+- 两个皮肤的帧画布尺寸不同时，按等比缩放、底部居中适配，可能留边或有轻微清晰度变化。
+- 点「只生成 Mod」会在 `made_mods` 下生成一个普通 Mod 文件夹，可到「Mod 管理」选择该文件夹安装；「生成并安装」会直接安装。安装前退出游戏，管理器照常备份原包。实测 101 基础 ↔ `01` 共 21 个公共动作、16 个立绘，互换包约 47 MB。
+
 **支持 / 不支持边界**
 
 - 支持：游戏里已经存在的皮肤；四边形瓦片和「每个小四边形」组成的高密度网格小人（皮肤小人常见）；立绘按原尺寸等比适配。
@@ -173,6 +181,7 @@ python selfcheck_clip_preview.py
 python selfcheck_clip_atlas.py
 python selfcheck_frame_atlas.py
 python selfcheck_hero_skins.py
+python selfcheck_skin_swap.py
 python -m unittest discover -s tests -p "test_*.py"
 node tests/test_animation_import_ui.js
 node tests/test_frontend_regressions.js
